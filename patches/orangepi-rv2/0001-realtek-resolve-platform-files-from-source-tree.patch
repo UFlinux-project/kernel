@@ -1,0 +1,32 @@
+Subject: [PATCH] rtl8852bs and rtl8852be: find platform makefiles in out-of-tree builds
+
+Kbuild sets src to the relative object directory. GNU make's wildcard
+does not use VPATH, so the platform include is empty with O= and the
+KY driver loses its endianness flags and platform object.
+
+Use Kbuild's source directory and preserve the standalone default.
+
+diff --git a/drivers/net/wireless/realtek/rtl8852bs/Makefile b/drivers/net/wireless/realtek/rtl8852bs/Makefile
+--- a/drivers/net/wireless/realtek/rtl8852bs/Makefile
++++ b/drivers/net/wireless/realtek/rtl8852bs/Makefile
+@@ -239,7 +239,7 @@ else
+ 	HAL = phl
+ endif
+ 
+-DRV_PATH = $(src)
++DRV_PATH = $(or $(kbuild-dir),$(src))
+ 
+ ########### HAL_RTL8852A #################################
+ ifeq ($(CONFIG_RTL8852A), y)
+diff --git a/drivers/net/wireless/realtek/rtl8852be/Makefile b/drivers/net/wireless/realtek/rtl8852be/Makefile
+--- a/drivers/net/wireless/realtek/rtl8852be/Makefile
++++ b/drivers/net/wireless/realtek/rtl8852be/Makefile
+@@ -748,7 +748,7 @@ endif
+ 
+ ########### PLATFORM OPS  ##########################
+ # Import platform assigned KSRC and CROSS_COMPILE
+-include $(wildcard $(src)/platform/*.mk)
++include $(wildcard $(or $(kbuild-dir),$(src))/platform/*.mk)
+ 
+ # Import platform specific compile options
+ EXTRA_CFLAGS += -I$(src)/platform
