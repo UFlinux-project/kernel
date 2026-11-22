@@ -1,0 +1,265 @@
+name: UFlinux kernels
+
+on:
+  pull_request:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+    inputs:
+      profile_target:
+        description: Optional target for a profiling build without publication
+        type: choice
+        default: none
+        options:
+          - none
+          - x86_64
+          - x86
+          - aarch64
+          - virt-x86_64
+          - virt-aarch64
+          - orangepi-rv2
+          - dragon-q6a
+          - rpi
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernels-${{ github.event_name == 'pull_request' && github.ref || 'release' }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.sources.outputs.matrix }}
+      fingerprint: ${{ steps.sources.outputs.fingerprint }}
+      build: ${{ steps.sources.outputs.build }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: sources
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROFILE_TARGET: ${{ inputs.profile_target || 'none' }}
+        run: |
+          if [[ "$PROFILE_TARGET" == none ]]; then
+            python3 scripts/resolve.py
+          else
+            python3 scripts/resolve.py --target "$PROFILE_TARGET"
+          fi
+          matrix=$(jq -c '{include:[.targets|to_entries[]|{target:.key,runner:.value.runner}]}' work/resolved.json)
+          source_hash=$(jq -r .fingerprint work/resolved.json)
+          recipe_hash=$(git ls-tree -r HEAD -- scripts patches profiles targets.json .github/workflows/kernels.yml | sha256sum | cut -d' ' -f1)
+          fingerprint=$(printf '%s\n%s\n' "$source_hash" "$recipe_hash" | sha256sum | cut -d' ' -f1)
+          tag="kernels-${fingerprint:0:24}"
+          build=true
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]] && gh release view "$tag" --json isDraft --jq '.isDraft' | grep -qx false; then
+            build=false
+          fi
+          printf 'matrix=%s\nfingerprint=%s\nbuild=%s\n' "$matrix" "$fingerprint" "$build" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: resolved-inputs
+          path: work/resolved.json
+          if-no-files-found: error
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    env:
+      TARGET: ${{ matrix.target }}
+      PROFILE_TARGET: ${{ inputs.profile_target || 'none' }}
+      UFLINUX_PKGREL: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: resolved-inputs
+          path: work
+      - name: Install emulators
+        run: |
+          case "$TARGET" in
+            orangepi-rv2)
+              sudo apt-get update
+              if apt-cache show qemu-user-static 2>/dev/null | grep '^Package: qemu-user-static$' >/dev/null; then
+                sudo apt-get install -y qemu-user-static binfmt-support
+              else
+                sudo apt-get install -y qemu-user-binfmt
+              fi
+              if [[ ! -r /proc/sys/fs/binfmt_misc/qemu-riscv64 ]]; then
+                sudo systemctl restart systemd-binfmt
+              fi
+              grep -Eq '^flags:.*F' /proc/sys/fs/binfmt_misc/qemu-riscv64
+              ;;
+            aarch64|virt-aarch64)
+              sudo apt-get update
+              sudo apt-get install -y qemu-system-arm
+              ;;
+            x86|x86_64|virt-x86_64)
+              sudo apt-get update
+              sudo apt-get install -y qemu-system-x86
+              ;;
+          esac
+      - name: Build and install-test APK
+        run: |
+          args=()
+          if [[ "$PROFILE_TARGET" != none ]]; then
+            args+=(--profile-build)
+          else
+            if ! scripts/prepare-bolt.sh "$TARGET" "work/$TARGET"; then
+              rm -f "work/$TARGET/bolt/llvm-bolt"
+              echo "::warning::BOLT tool unavailable for $TARGET"
+            fi
+          fi
+          scripts/container.sh "$TARGET" work/resolved.json "work/$TARGET" "${args[@]}"
+      - name: Boot generic and guest kernels
+        run: scripts/boot-test.sh "$TARGET" "work/$TARGET"
+      - name: Collect release files
+        run: |
+          mkdir -p dist
+          cp work/"$TARGET"/*.apk work/"$TARGET"/source-*.tar.zst dist/
+          cp work/"$TARGET"/build.json "dist/build-$TARGET.json"
+          if [[ "$PROFILE_TARGET" != none ]]; then
+            zstd -T2 "work/$TARGET/vmlinux" -o "dist/vmlinux-$TARGET.zst"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kernel-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/upload-artifact@v7
+        if: inputs.profile_target == 'none' || inputs.profile_target == ''
+        with:
+          name: install-${{ matrix.target }}
+          path: |
+            work/${{ matrix.target }}/*.apk
+            work/${{ matrix.target }}/*.rsa.pub
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diagnostics-${{ matrix.target }}
+          path: |
+            work/${{ matrix.target }}/kernel.config
+            work/${{ matrix.target }}/boot-test.log
+
+  coexist:
+    needs: [resolve, build]
+    if: inputs.profile_target == 'none' || inputs.profile_target == ''
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: resolved-inputs
+          path: work
+      - uses: actions/download-artifact@v8
+        with:
+          name: install-${{ matrix.arch }}
+          path: work/generic
+      - uses: actions/download-artifact@v8
+        with:
+          name: install-virt-${{ matrix.arch }}
+          path: work/virt
+      - name: Install generic and guest kernels together
+        run: |
+          source scripts/container.sh
+          image=$(alpine_image work/resolved.json "$TARGET_ARCH")
+          series=$(jq -r '.alpine.x86_64.series' work/resolved.json)
+          docker run --rm -v "$PWD/work:/work:ro" -v "$PWD/scripts:/scripts:ro" "$image" sh -ec '
+            printf "https://dl-cdn.alpinelinux.org/alpine/%s/main\n" "$1" >/etc/apk/repositories
+            . /scripts/guest-root.sh
+            install_guest_root "$2"
+            for flavor in generic virt; do
+              apk_file=$(find "/work/$flavor" -name "*.apk" -type f)
+              # The signature includes the original abuild public-key basename.
+              key_name=$(ls "/work/$flavor/"*.rsa.pub)
+              cp "$key_name" "/guest/etc/apk/keys/${key_name##*/}"
+              cp "$apk_file" "/guest/$flavor.apk"
+            done
+            chroot /guest apk add /generic.apk /virt.apk
+            for flavor in "$2" "virt-$2"; do
+              test -s "/guest/boot/vmlinuz-uflinux-$flavor"
+              test -s "/guest/boot/initramfs-uflinux-$flavor"
+            done
+          ' sh "$series" "$TARGET_ARCH"
+
+  publish:
+    needs: [resolve, build, coexist]
+    if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch && (inputs.profile_target == 'none' || inputs.profile_target == '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FINGERPRINT: ${{ needs.resolve.outputs.fingerprint }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: kernel-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: resolved-inputs
+          path: work
+      - name: Check release assets
+        run: |
+          shopt -s nullglob
+          for target in $(jq -r 'keys[]' targets.json); do
+            files=(dist/linux-uflinux-"$target"-[0-9]*.apk)
+            [[ ${#files[@]} == 1 ]]
+            test -s "dist/build-$target.json"
+            test -s "dist/source-$target.tar.zst"
+          done
+          cp work/resolved.json dist/
+          printf '%s\n' "$FINGERPRINT" > dist/input-fingerprint.txt
+          source scripts/container.sh
+          alpine_image work/resolved.json x86_64 > work/signing-image
+      - name: Sign and verify APKs
+        env:
+          UFLINUX_APK_SIGNING_KEY: ${{ secrets.UFLINUX_APK_SIGNING_KEY }}
+        run: |
+          series=$(jq -r '.alpine.x86_64.series' work/resolved.json)
+          docker run --rm -e UFLINUX_APK_SIGNING_KEY -v "$PWD/dist:/dist" \
+            -v "$PWD/scripts/sign.py:/sign.py:ro" "$(cat work/signing-image)" sh -ec '
+              printf "https://dl-cdn.alpinelinux.org/alpine/%s/main\n" "$1" >/etc/apk/repositories
+              apk add --no-progress abuild openssl python3
+              python3 /sign.py /dist
+            ' sh "$series"
+      - name: Publish complete release
+        run: |
+          tag="kernels-${FINGERPRINT:0:24}"
+          if state=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            if [[ "$state" == false ]]; then exit 0; fi
+          else
+            gh release create "$tag" --draft --target "$GITHUB_SHA" --title "UFlinux kernels ${FINGERPRINT:0:12}" \
+              --notes "Signed Alpine kernel APKs for eight targets. See the build manifests and SHA256SUMS."
+          fi
+          gh release upload "$tag" dist/* --clobber
+          gh release edit "$tag" --draft=false
