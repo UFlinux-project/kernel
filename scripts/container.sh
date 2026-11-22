@@ -49,6 +49,7 @@ major=$(jq -r --arg arch "$builder" '.toolchains[$arch].major' "$resolved")
 build_image=$(alpine_image "$resolved" "$builder")
 package_image=$(alpine_image "$resolved" "$architecture")
 # Map the rolling mirror to the stable Alpine series chosen by the resolver.
+aports_ref=$(jq -er .aports "$resolved")
 series=$(jq -r '.alpine.x86_64.series' "$resolved")
 printf 'https://dl-cdn.alpinelinux.org/alpine/%s/main\nhttps://dl-cdn.alpinelinux.org/alpine/%s/community\n' "$series" "$series" >"$output/repositories"
 cp "$resolved" "$output/resolved.json"
@@ -74,9 +75,13 @@ cp "$resolved" "$output/resolved.json"
     python3 /builder/scripts/build.py "$target" /out/resolved.json /out "$@"
     ' sh "$major" "$target" "$profile"
 
+# The literal script receives its positional arguments inside the package container.
+# shellcheck disable=SC2016
 "$runtime" run --rm "${container_options[@]}" --platform "$(jq -r --arg a "$architecture" '.alpine[$a].platform | "linux/"+.' "$resolved")" \
     -v "$repo:/builder:ro" -v "$output:/out" "$package_image" sh -ec '
     cp /out/repositories /etc/apk/repositories
+    sh /builder/scripts/build-apk-zstd.sh "$1" /out
+    shift
     apk add --no-progress python3
     sh /builder/scripts/package.sh "$@"
-    ' sh "$target" "$version" "$revision" "$architecture"
+    ' sh "$aports_ref" "$target" "$version" "$revision" "$architecture"

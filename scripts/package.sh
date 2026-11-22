@@ -5,33 +5,20 @@ name=$1
 version=$2
 revision=$3
 architecture=$4
-apk add --no-progress alpine-sdk kmod mkinitfs e2fsprogs iproute2 findutils
-mkdir -p /aports/local/linux /root/.abuild
-# The build job signs with an isolated, disposable key.
-key="/root/.abuild/uflinux-build-$name.rsa"
-openssl genrsa -out "$key" 2048
-openssl rsa -in "$key" -pubout -out "$key.pub"
-printf "PACKAGER_PRIVKEY='%s'\n" "$key" >/root/.abuild/abuild.conf
+apk add --no-progress openssl kmod mkinitfs e2fsprogs iproute2 findutils
+keydir=$(mktemp -d)
+trap 'rm -rf "$keydir"' EXIT
+key="$keydir/uflinux-build-$name.ec.pem"
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:secp384r1 -out "$key"
+openssl pkey -in "$key" -pubout -out "$key.pub"
 cp "$key.pub" /etc/apk/keys/
-cd /aports/local/linux
-cat > APKBUILD <<APKBUILD
-# Maintainer: UFlinux Project <UFlinux-project@users.noreply.github.com>
-pkgname=linux-uflinux-$name
-pkgver=$version
-pkgrel=$revision
-pkgdesc="UFlinux kernel for $name"
-url="https://github.com/UFlinux-project/kernel"
-arch="$architecture"
-license="GPL-2.0-only"
-depends="mkinitfs kmod"
-options="!check !strip !tracedeps !archcheck"
-package() {
-    mkdir -p "\$pkgdir"
-    cp -a /out/stage/. "\$pkgdir/"
-}
-APKBUILD
-abuild -F -r
-cp /root/packages/*/"$architecture"/*.apk /out/
+package="linux-uflinux-$name"
+release="$version-r$revision"
+/out/apk-zstd mkpkg --xattrs=no --files /out/stage --compression zstd:9 --sign-key "$key" \
+    --info "name:$package" --info "version:$release" --info "arch:$architecture" \
+    --info "description:UFlinux kernel for $name" --info "license:GPL-2.0-only" \
+    --info "url:https://github.com/UFlinux-project/kernel" --info "depends:mkinitfs kmod" \
+    --output "/out/$package-$release.apk"
 cp "$key.pub" /out/
 
 # shellcheck source=scripts/guest-root.sh
@@ -39,8 +26,9 @@ cp "$key.pub" /out/
 install_guest_root "$architecture"
 # Run test-root tools in their own root, including apk's kernel triggers.
 cp /out/*.apk /guest/test-kernel.apk
-chroot /guest apk add /test-kernel.apk
-rm /guest/test-kernel.apk
+cp /out/apk-zstd /guest/tmp/apk-zstd
+chroot /guest /tmp/apk-zstd add /test-kernel.apk
+rm /guest/test-kernel.apk /guest/tmp/apk-zstd
 for path in "boot/vmlinuz-uflinux-$name" "boot/initramfs-uflinux-$name"; do
     test -s "/guest/$path"
 done
@@ -51,7 +39,7 @@ test -n "$module"
 test "$(modinfo -F vermagic "$module" | cut -d ' ' -f1)" = "$abi"
 cp "/guest/boot/initramfs-uflinux-$name" /out/initramfs
 chmod 644 /out/initramfs
-apk verify /out/*.apk
+/out/apk-zstd verify /out/*.apk
 
 case "$name" in
   x86|x86_64|aarch64|virt-*) ;;

@@ -128,6 +128,15 @@ jobs:
           mkdir -p dist
           cp work/"$TARGET"/*.apk work/"$TARGET"/source-*.tar.zst dist/
           cp work/"$TARGET"/build.json "dist/build-$TARGET.json"
+          case "$TARGET" in
+            x86|x86_64|aarch64|orangepi-rv2)
+              arch=$(jq -r --arg target "$TARGET" '.[$target].apk' targets.json)
+              cp work/"$TARGET"/apk-zstd "dist/apk-zstd-$arch"
+              ;;
+          esac
+          if [[ "$TARGET" == x86_64 ]]; then
+            cp work/"$TARGET"/source-apk-zstd.tar.gz dist/
+          fi
           if [[ "$PROFILE_TARGET" != none ]]; then
             zstd -T2 "work/$TARGET/vmlinux" -o "dist/vmlinux-$TARGET.zst"
           fi
@@ -143,7 +152,8 @@ jobs:
           name: install-${{ matrix.target }}
           path: |
             work/${{ matrix.target }}/*.apk
-            work/${{ matrix.target }}/*.rsa.pub
+            work/${{ matrix.target }}/*.ec.pem.pub
+            work/${{ matrix.target }}/apk-zstd
           if-no-files-found: error
           compression-level: 0
       - uses: actions/upload-artifact@v7
@@ -194,12 +204,13 @@ jobs:
             install_guest_root "$2"
             for flavor in generic virt; do
               apk_file=$(find "/work/$flavor" -name "*.apk" -type f)
-              # The signature includes the original abuild public-key basename.
-              key_name=$(ls "/work/$flavor/"*.rsa.pub)
+              key_name=$(ls "/work/$flavor/"*.ec.pem.pub)
               cp "$key_name" "/guest/etc/apk/keys/${key_name##*/}"
               cp "$apk_file" "/guest/$flavor.apk"
             done
-            chroot /guest apk add /generic.apk /virt.apk
+            cp /work/generic/apk-zstd /guest/tmp/apk-zstd
+            chmod +x /guest/tmp/apk-zstd
+            chroot /guest /tmp/apk-zstd add /generic.apk /virt.apk
             for flavor in "$2" "virt-$2"; do
               test -s "/guest/boot/vmlinuz-uflinux-$flavor"
               test -s "/guest/boot/initramfs-uflinux-$flavor"
@@ -237,20 +248,34 @@ jobs:
             test -s "dist/build-$target.json"
             test -s "dist/source-$target.tar.zst"
           done
+          for arch in x86 x86_64 aarch64 riscv64; do
+            test -s "dist/apk-zstd-$arch"
+          done
+          test -s dist/source-apk-zstd.tar.gz
           cp work/resolved.json dist/
           printf '%s\n' "$FINGERPRINT" > dist/input-fingerprint.txt
           source scripts/container.sh
           alpine_image work/resolved.json x86_64 > work/signing-image
+      - name: Build Zstandard-enabled signing tool
+        run: |
+          series=$(jq -r '.alpine.x86_64.series' work/resolved.json)
+          aports_ref=$(jq -er .aports work/resolved.json)
+          docker run --rm -v "$PWD/scripts:/scripts:ro" -v "$PWD/work:/work" \
+            "$(cat work/signing-image)" sh -ec '
+              printf "https://dl-cdn.alpinelinux.org/alpine/%s/main\n" "$1" >/etc/apk/repositories
+              sh /scripts/build-apk-zstd.sh "$2" /work/signing-tools
+            ' sh "$series" "$aports_ref"
       - name: Sign and verify APKs
         env:
           UFLINUX_APK_SIGNING_KEY: ${{ secrets.UFLINUX_APK_SIGNING_KEY }}
         run: |
           series=$(jq -r '.alpine.x86_64.series' work/resolved.json)
           docker run --rm -e UFLINUX_APK_SIGNING_KEY -v "$PWD/dist:/dist" \
+            -v "$PWD/work/signing-tools/apk-zstd:/apk-zstd:ro" \
             -v "$PWD/scripts/sign.py:/sign.py:ro" "$(cat work/signing-image)" sh -ec '
               printf "https://dl-cdn.alpinelinux.org/alpine/%s/main\n" "$1" >/etc/apk/repositories
-              apk add --no-progress abuild openssl python3
-              python3 /sign.py /dist
+              apk add --no-progress openssl python3
+              UFLINUX_APK=/apk-zstd python3 /sign.py /dist
             ' sh "$series"
       - name: Publish complete release
         run: |
