@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   resolve:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       matrix: ${{ steps.sources.outputs.matrix }}
       fingerprint: ${{ steps.sources.outputs.fingerprint }}
@@ -161,9 +161,9 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
           - arch: aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
     runs-on: ${{ matrix.runner }}
     env:
       TARGET_ARCH: ${{ matrix.arch }}
@@ -209,7 +209,7 @@ jobs:
   publish:
     needs: [resolve, build, coexist]
     if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch && (inputs.profile_target == 'none' || inputs.profile_target == '')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     env:

@@ -1,10 +1,10 @@
 {
-  "x86_64":       {"source":"stable", "arch":"x86",   "apk":"x86_64",  "runner":"ubuntu-latest",    "config":"lts.x86_64.config",   "image":"arch/x86/boot/bzImage"},
-  "x86":          {"source":"stable", "arch":"x86",   "apk":"x86",     "runner":"ubuntu-latest",    "config":"lts.x86.config",      "image":"arch/x86/boot/bzImage"},
-  "aarch64":      {"source":"stable", "arch":"arm64", "apk":"aarch64", "runner":"ubuntu-24.04-arm","config":"lts.aarch64.config",  "image":"arch/arm64/boot/Image.gz"},
-  "virt-x86_64":  {"source":"stable", "arch":"x86",   "apk":"x86_64",  "runner":"ubuntu-latest",    "config":"virt.x86_64.config",  "image":"arch/x86/boot/bzImage"},
-  "virt-aarch64": {"source":"stable", "arch":"arm64", "apk":"aarch64", "runner":"ubuntu-24.04-arm","config":"virt.aarch64.config", "image":"arch/arm64/boot/Image.gz"},
-  "orangepi-rv2": {"source":"orange", "arch":"riscv", "apk":"riscv64", "runner":"ubuntu-latest",    "image":"arch/riscv/boot/Image", "dtbs":["ky/x1_orangepi-rv2.dtb"]},
-  "dragon-q6a":   {"source":"radxa",  "arch":"arm64", "apk":"aarch64", "runner":"ubuntu-24.04-arm", "image":"arch/arm64/boot/Image.gz", "dtbs":["qcom/*dragon*q6a*.dtb"]},
-  "rpi":          {"source":"pi",     "arch":"arm64", "apk":"aarch64", "runner":"ubuntu-24.04-arm","defconfig":["bcm2711_defconfig"], "image":"arch/arm64/boot/Image.gz", "dtbs":["broadcom/bcm2710-rpi-3-b.dtb","broadcom/bcm2711-rpi-4-b.dtb","broadcom/bcm2712-rpi-5-b.dtb"]}
+  "x86_64":       {"source":"stable", "arch":"x86",   "apk":"x86_64",  "runner":"ubuntu-26.04",    "config":"lts.x86_64.config",   "image":"arch/x86/boot/bzImage"},
+  "x86":          {"source":"stable", "arch":"x86",   "apk":"x86",     "runner":"ubuntu-26.04",    "config":"lts.x86.config",      "image":"arch/x86/boot/bzImage"},
+  "aarch64":      {"source":"stable", "arch":"arm64", "apk":"aarch64", "runner":"ubuntu-26.04-arm","config":"lts.aarch64.config",  "image":"arch/arm64/boot/Image.gz"},
+  "virt-x86_64":  {"source":"stable", "arch":"x86",   "apk":"x86_64",  "runner":"ubuntu-26.04",    "config":"virt.x86_64.config",  "image":"arch/x86/boot/bzImage"},
+  "virt-aarch64": {"source":"stable", "arch":"arm64", "apk":"aarch64", "runner":"ubuntu-26.04-arm","config":"virt.aarch64.config", "image":"arch/arm64/boot/Image.gz"},
+  "orangepi-rv2": {"source":"orange", "arch":"riscv", "apk":"riscv64", "runner":"ubuntu-26.04",    "image":"arch/riscv/boot/Image", "dtbs":["ky/x1_orangepi-rv2.dtb"]},
+  "dragon-q6a":   {"source":"radxa",  "arch":"arm64", "apk":"aarch64", "runner":"ubuntu-26.04-arm", "image":"arch/arm64/boot/Image.gz", "dtbs":["qcom/*dragon*q6a*.dtb"]},
+  "rpi":          {"source":"pi",     "arch":"arm64", "apk":"aarch64", "runner":"ubuntu-26.04-arm","defconfig":["bcm2711_defconfig"], "image":"arch/arm64/boot/Image.gz", "dtbs":["broadcom/bcm2710-rpi-3-b.dtb","broadcom/bcm2711-rpi-4-b.dtb","broadcom/bcm2712-rpi-5-b.dtb"]}
 }
