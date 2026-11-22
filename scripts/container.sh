@@ -48,11 +48,20 @@ version=$(jq -r --arg name "$target" '.targets[$name].version' "$resolved")
 major=$(jq -r --arg arch "$builder" '.toolchains[$arch].major' "$resolved")
 build_image=$(alpine_image "$resolved" "$builder")
 package_image=$(alpine_image "$resolved" "$architecture")
+package_platform=$(jq -er --arg a "$architecture" '.alpine[$a].platform | "linux/"+.' "$resolved")
 # Map the rolling mirror to the stable Alpine series chosen by the resolver.
 aports_ref=$(jq -er .aports "$resolved")
 series=$(jq -r '.alpine.x86_64.series' "$resolved")
 printf 'https://dl-cdn.alpinelinux.org/alpine/%s/main\nhttps://dl-cdn.alpinelinux.org/alpine/%s/community\n' "$series" "$series" >"$output/repositories"
 cp "$resolved" "$output/resolved.json"
+# Prepare packaging tools before starting the long kernel compilation.
+# shellcheck disable=SC2016
+"$runtime" run --rm "${container_options[@]}" --platform "$package_platform" \
+    -v "$repo:/builder:ro" -v "$output:/out" "$package_image" sh -ec '
+    cp /out/repositories /etc/apk/repositories
+    sh /builder/scripts/build-apk-zstd.sh "$1" "$2" /out
+    ' sh "$aports_ref" "$series"
+
 # The literal script expands its arguments inside the Alpine build container.
 # shellcheck disable=SC2016
 "$runtime" run --rm "${container_options[@]}" --platform "$(jq -r --arg a "$builder" '.alpine[$a].platform | "linux/"+.' "$resolved")" \
@@ -75,13 +84,9 @@ cp "$resolved" "$output/resolved.json"
     python3 /builder/scripts/build.py "$target" /out/resolved.json /out "$@"
     ' sh "$major" "$target" "$profile"
 
-# The literal script receives its positional arguments inside the package container.
-# shellcheck disable=SC2016
-"$runtime" run --rm "${container_options[@]}" --platform "$(jq -r --arg a "$architecture" '.alpine[$a].platform | "linux/"+.' "$resolved")" \
+"$runtime" run --rm "${container_options[@]}" --platform "$package_platform" \
     -v "$repo:/builder:ro" -v "$output:/out" "$package_image" sh -ec '
     cp /out/repositories /etc/apk/repositories
-    sh /builder/scripts/build-apk-zstd.sh "$1" /out
-    shift
     apk add --no-progress python3
     sh /builder/scripts/package.sh "$@"
-    ' sh "$aports_ref" "$target" "$version" "$revision" "$architecture"
+    ' sh "$target" "$version" "$revision" "$architecture"

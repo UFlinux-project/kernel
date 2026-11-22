@@ -263,7 +263,7 @@ jobs:
           docker run --rm -v "$PWD/scripts:/scripts:ro" -v "$PWD/work:/work" \
             "$(cat work/signing-image)" sh -ec '
               printf "https://dl-cdn.alpinelinux.org/alpine/%s/main\n" "$1" >/etc/apk/repositories
-              sh /scripts/build-apk-zstd.sh "$2" /work/signing-tools
+              sh /scripts/build-apk-zstd.sh "$2" "$1" /work/signing-tools
             ' sh "$series" "$aports_ref"
       - name: Sign and verify APKs
         env:
