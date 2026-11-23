@@ -1,0 +1,18 @@
+Subject: [PATCH] bcmdhd: resolve driver headers from the source tree
+
+With an out-of-tree kernel build, src names the object directory.
+Use Kbuild's driver source directory for the vendor headers while
+retaining src as the fallback for standalone builds.
+
+diff --git a/drivers/net/wireless/bcmdhd/Makefile b/drivers/net/wireless/bcmdhd/Makefile
+--- a/drivers/net/wireless/bcmdhd/Makefile
++++ b/drivers/net/wireless/bcmdhd/Makefile
+@@ -480,7 +480,7 @@ endif
+ endif
+ 
+ ARCH ?= arm64
+-BCMDHD_ROOT = $(src)
++BCMDHD_ROOT = $(or $(kbuild-dir),$(src))
+ #$(warning "BCMDHD_ROOT=$(BCMDHD_ROOT)")
+ EXTRA_CFLAGS = $(DHDCFLAGS)
+ EXTRA_CFLAGS += -DDHD_COMPILED=\"$(BCMDHD_ROOT)\"

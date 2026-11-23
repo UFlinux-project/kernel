@@ -1,0 +1,16 @@
+Subject: [PATCH] drm/gud: keep the default optimization level for EDID code
+
+Clang's -O3 build trips the fortified read check in gud_connector.o.
+Keep Kbuild's optimization level for that translation unit so the
+rest of the kernel can build with -O3.
+
+diff --git a/drivers/gpu/drm/gud/Makefile b/drivers/gpu/drm/gud/Makefile
+--- a/drivers/gpu/drm/gud/Makefile
++++ b/drivers/gpu/drm/gud/Makefile
+@@ -1,4 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0
++
++CFLAGS_REMOVE_gud_connector.o += -O3
+ 
+ gud-y				:= gud_drv.o gud_pipe.o gud_connector.o
+ obj-$(CONFIG_DRM_GUD)		+= gud.o

@@ -78,6 +78,7 @@ cp "$resolved" "$output/resolved.json"
         done
     done
     export PATH="/out/bolt:/opt/llvm-bin:$PATH"
+    if [ -d /out/profiles ]; then export UFLINUX_PROFILE_DIR=/out/profiles; fi
     if [ -n "$3" ]; then set -- "$2" "$3"; else set -- "$2"; fi
     target=$1
     shift
@@ -89,4 +90,5 @@ cp "$resolved" "$output/resolved.json"
     cp /out/repositories /etc/apk/repositories
     apk add --no-progress python3
     sh /builder/scripts/package.sh "$@"
-    ' sh "$target" "$version" "$revision" "$architecture"
+    ' sh "$target" "$version" "$revision" "$architecture" \
+    "${UFLINUX_PROFILE_GUEST:-}" "${KERNEL_AUTOFDO_EVENT:-}"

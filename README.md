@@ -34,6 +34,10 @@ For an AutoFDO collection kernel, choose a target in the workflow's `profile_tar
 
 For BOLT, profile the exact baseline x86_64 kernel, following the [LLVM BOLT kernel instructions](https://github.com/llvm/llvm-project/blob/main/bolt/docs/OptimizingLinux.md). Add `profiles/<target>/kernel.fdata` and `bolt.json` with the kernel `source`, profile `sha256`, and baseline ELF `build_id` from `readelf -n vmlinux`. Keep the compiler, build configuration, and AutoFDO inputs identical to the baseline. CI discovers the runner's latest available Ubuntu BOLT package only when an x86_64 BOLT profile is present. Locally, supply an executable at `<output>/bolt/llvm-bolt` if the Alpine build image has no BOLT tool. Profiles are optional, and profiling runs produce workflow artifacts without publishing a release.
 
+To generate profiles during a full release, dispatch the workflow on the default branch with `profile_target=none` and `generate_release_profiles=true`. The **profile-release** job collects AutoFDO data for `virt-x86_64`, rebuilds that target with AutoFDO, then collects BOLT data from the linked kernel. Both passes run mixed block I/O and loopback TCP in a KVM guest. The release build uses the resulting workflow artifact and checks that both optimizations were applied.
+
+The profiling runner needs Ubuntu 26.04, Docker, writable `/dev/kvm`, and a CPU and KVM configuration that expose branch recording to the guest. Set the repository variable `KERNEL_PROFILE_RUNNER` to the label of a compatible runner if needed. The default AutoFDO event is Intel's `br_inst_retired.near_taken:k`. Set `KERNEL_AUTOFDO_EVENT` to the appropriate `perf` event for another supported CPU.
+
 ## Publish and install
 
 Set the repository Actions secret `UFLINUX_APK_SIGNING_KEY` to the PEM-encoded ECDSA P-384 (secp384r1) private key used for UFlinux APK signing. The default-branch publishing job uses it to replace the temporary build signatures and verify every APK. The published release includes the public key, Zstandard-compressed APKv3 packages, SHA-256 checksums, resolved inputs, build manifests, and configured kernel sources.

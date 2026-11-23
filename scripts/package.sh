@@ -5,6 +5,7 @@ name=$1
 version=$2
 revision=$3
 architecture=$4
+profile_guest=${5:-}
 apk add --no-progress openssl kmod mkinitfs e2fsprogs iproute2 findutils
 keydir=$(mktemp -d)
 trap 'rm -rf "$keydir"' EXIT
@@ -45,6 +46,11 @@ case "$name" in
   x86|x86_64|aarch64|virt-*) ;;
   *) exit 0;;
 esac
+if [ -n "$profile_guest" ]; then
+    apk --root /guest add --no-progress perf fio iperf3
+    install -m 755 "$(dirname "$0")/profile-guest.sh" /guest/sbin/uflinux-profile
+    printf '%s\n' "$profile_guest" "${6:-}" > /guest/etc/uflinux-profile
+fi
 python3 - /out/build.json <<'PY'
 import json, sys
 from pathlib import Path

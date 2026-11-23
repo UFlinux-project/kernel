@@ -7,10 +7,13 @@ case "$target" in
     x86_64|virt-x86_64) ;;
     *) exit 0 ;;
 esac
-test -s "profiles/$target/kernel.fdata" || exit 0
+test -s "${3:-profiles/$target}/kernel.fdata" || exit 0
 
 sudo apt-get update
-package=$(apt-cache search --names-only '^bolt-[0-9]+$' | cut -d' ' -f1 | sort -V | tail -1)
+package=${UFLINUX_BOLT_PACKAGE:-}
+if [[ -z "$package" ]]; then
+    package=$(apt-cache search --names-only '^bolt-[0-9]+$' | cut -d' ' -f1 | sort -V | tail -1)
+fi
 test -n "$package" || exit 0
 sudo apt-get install -y "$package"
 binary=$(command -v "llvm-bolt-${package#bolt-}")

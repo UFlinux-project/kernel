@@ -143,7 +143,7 @@ def configure(kernel, obj, target, name, kbuild, bbr, autofdo, gcc=False):
 
 
 def profile(name, kind, target):
-    folder = ROOT / "profiles" / name
+    folder = Path(os.environ.get("UFLINUX_PROFILE_DIR", ROOT / "profiles" / name))
     path = folder / ("kernel.afdo" if kind == "autofdo" else "kernel.fdata")
     metadata = folder / f"{kind}.json"
     if not path.is_file() or not metadata.is_file():
