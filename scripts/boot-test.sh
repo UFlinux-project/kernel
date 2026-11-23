@@ -31,7 +31,7 @@ fi
 
 timeout 240 "$emulator" -machine "$machine,accel=$accelerator" -cpu "$cpu" -m 1024 \
     -nographic -no-reboot -monitor none -kernel "$kernel" -initrd "$output/initramfs" \
-    -drive "if=virtio,format=raw,file=$output/boot-test.ext4" \
+    -drive "if=virtio,format=raw,snapshot=on,file=$output/boot-test.ext4" \
     -nic user,model=virtio-net-pci \
     -append "console=$serial root=/dev/vda rootfstype=ext4 rw init=/sbin/uflinux-test panic=1" \
     2>&1 | tee "$output/boot-test.log"

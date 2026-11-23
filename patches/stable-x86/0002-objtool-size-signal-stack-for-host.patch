@@ -1,0 +1,37 @@
+Subject: [PATCH] objtool: allow for the host signal frame on the alternate stack
+
+On musl, SIGSTKSZ is fixed and can be smaller than the x86 signal
+frame on runners with large extended CPU state. Reserve the size
+reported by the kernel in addition to space for the handler.
+
+diff --git a/tools/objtool/signal.c b/tools/objtool/signal.c
+--- a/tools/objtool/signal.c
++++ b/tools/objtool/signal.c
+@@ -8,6 +8,7 @@
+ #include <stdlib.h>
+ #include <signal.h>
+ #include <unistd.h>
++#include <sys/auxv.h>
+ #include <sys/resource.h>
+ #include <string.h>
+ 
+@@ -106,16 +107,17 @@
+ 	if (read_stack_limit())
+ 		return -1;
+ 
+-	ss.ss_sp = malloc(SIGSTKSZ);
++	ss.ss_size = SIGSTKSZ + getauxval(AT_MINSIGSTKSZ);
++	ss.ss_sp = malloc(ss.ss_size);
+ 	if (!ss.ss_sp) {
+ 		ERROR_GLIBC("malloc");
+ 		return -1;
+ 	}
+-	ss.ss_size = SIGSTKSZ;
+ 	ss.ss_flags = 0;
+ 
+ 	if (sigaltstack(&ss, NULL) == -1) {
+ 		ERROR_GLIBC("sigaltstack");
++		free(ss.ss_sp);
+ 		return -1;
+ 	}
+ 

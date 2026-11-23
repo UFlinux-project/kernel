@@ -244,7 +244,10 @@ def main():
     records = {}
     for index, url in enumerate(target.get("vendor_patches", [])):
         apply_candidates(kernel, f"vendor-{index}", [url], records, required=True)
-    for patch in sorted((ROOT / "patches" / name).glob("*.patch")):
+    patch_root = ROOT / "patches"
+    source_patches = patch_root / f"{target['source']}-{target['arch']}"
+    target_patches = patch_root / name
+    for patch in sorted(source_patches.glob("*.patch")) + sorted(target_patches.glob("*.patch")):
         run("git", "apply", str(patch), cwd=kernel)
         records[patch.name] = {"sha256": hashlib.sha256(patch.read_bytes()).hexdigest()}
     if bbr_implementation(kernel) is None:

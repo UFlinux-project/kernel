@@ -1,0 +1,17 @@
+Subject: [PATCH] bcmdhd: only disable maybe-uninitialized when supported
+
+Clang rejects the GCC-specific warning option. Use Kbuild to probe
+for support so that the driver can build with either compiler.
+
+diff --git a/drivers/net/wireless/bcmdhd/Makefile b/drivers/net/wireless/bcmdhd/Makefile
+--- a/drivers/net/wireless/bcmdhd/Makefile
++++ b/drivers/net/wireless/bcmdhd/Makefile
+@@ -69,7 +69,7 @@
+ #CONFIG_BCMDHD_DTS := y
+ 
+ DHDCFLAGS = -Wall -Wstrict-prototypes -Wno-date-time                      \
+-	-Wno-maybe-uninitialized                                              \
++	$(call cc-disable-warning,maybe-uninitialized)                            \
+ 	-Dlinux -DLINUX -DBCMDRIVER -DBCMUTILS_ERR_CODES                      \
+ 	-DBCMDONGLEHOST -DBCMDMA32 -DBCMFILEIMAGE                             \
+ 	-DDHDTHREAD -DDHD_DEBUG -DSHOW_EVENTS -DGET_OTP_MAC_ENABLE            \

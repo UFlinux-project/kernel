@@ -1,0 +1,17 @@
+Subject: [PATCH] x86/tools: include compiler definitions before decoder headers
+
+The decoder headers can pull in kernel UAPI headers via the system
+asm/byteorder.h. Include the tools definition of __attribute_const__
+before that happens, as insn_decoder_test already does indirectly.
+
+diff --git a/arch/x86/tools/insn_sanity.c b/arch/x86/tools/insn_sanity.c
+--- a/arch/x86/tools/insn_sanity.c
++++ b/arch/x86/tools/insn_sanity.c
+@@ -14,6 +14,7 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <fcntl.h>
++#include <linux/compiler.h>
+ #include <asm/insn.h>
+ #include <inat.c>
+ #include <insn.c>
