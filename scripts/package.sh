@@ -47,9 +47,8 @@ case "$name" in
   *) exit 0;;
 esac
 if [ -n "$profile_guest" ]; then
-    apk --root /guest add --no-progress perf fio iperf3
+    apk --root /guest add --no-progress fio iperf3
     install -m 755 "$(dirname "$0")/profile-guest.sh" /guest/sbin/uflinux-profile
-    printf '%s\n' "$profile_guest" "${6:-}" > /guest/etc/uflinux-profile
 fi
 python3 - /out/build.json <<'PY'
 import json, sys

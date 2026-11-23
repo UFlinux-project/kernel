@@ -28,20 +28,8 @@ trap 'profile_failed "$?"' EXIT
 grep -qs ' /proc proc ' /proc/mounts || mount -t proc proc /proc
 grep -qs ' /sys sysfs ' /proc/mounts || mount -t sysfs sysfs /sys
 mount -o remount,rw /
-{
-    IFS= read -r mode
-    IFS= read -r event
-} </etc/uflinux-profile
-case "$mode" in
-    autofdo) set -- -e "${event:?Missing AutoFDO perf event}" -c 500009 -N -j any,k ;;
-    bolt) set -- -e cycles:k -F 1000 -j any,k ;;
-    *) exit 2 ;;
-esac
-perf record -a "$@" -o /kernel.perf.data -- "$0" workload
-if ! perf script -i /kernel.perf.data -F brstack | awk 'NF { samples++ } END { exit !samples }'; then
-    echo "perf did not produce readable branch samples for $mode" >&2
-    exit 1
-fi
+echo UFLINUX_PROFILE_START
+"$0" workload
 sync
 echo UFLINUX_PROFILE_OK
 trap - EXIT

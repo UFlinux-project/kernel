@@ -91,4 +91,4 @@ cp "$resolved" "$output/resolved.json"
     apk add --no-progress python3
     sh /builder/scripts/package.sh "$@"
     ' sh "$target" "$version" "$revision" "$architecture" \
-    "${UFLINUX_PROFILE_GUEST:-}" "${KERNEL_AUTOFDO_EVENT:-}"
+    "${UFLINUX_PROFILE_GUEST:-}"

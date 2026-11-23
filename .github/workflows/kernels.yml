@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       generate_release_profiles:
-        description: Generate AutoFDO and BOLT profiles for virt-x86_64 before building the release
+        description: Generate profiles for generic and virtual x86_64 and AArch64 kernels
         type: boolean
         default: false
       profile_target:
@@ -33,6 +33,7 @@ jobs:
     runs-on: ubuntu-26.04
     outputs:
       matrix: ${{ steps.sources.outputs.matrix }}
+      profile_matrix: ${{ steps.sources.outputs.profile_matrix }}
       fingerprint: ${{ steps.sources.outputs.fingerprint }}
       build: ${{ steps.sources.outputs.build }}
     steps:
@@ -55,7 +56,11 @@ jobs:
           else
             python3 scripts/resolve.py --target "$PROFILE_TARGET"
           fi
-          matrix=$(jq -c '{include:[.targets|to_entries[]|{target:.key,runner:.value.runner}]}' work/resolved.json)
+          matrix=$(jq -c '{include:[.targets|to_entries[]|{
+            target:.key,runner:.value.runner,
+            profile:(.value.source == "stable" and (.value.apk == "x86_64" or .value.apk == "aarch64"))
+          }]}' work/resolved.json)
+          profile_matrix=$(jq -c '{include:[.include[]|select(.profile)]}' <<< "$matrix")
           source_hash=$(jq -r .fingerprint work/resolved.json)
           recipe_hash=$(git ls-tree -r HEAD -- scripts patches profiles targets.json .github/workflows/kernels.yml | sha256sum | cut -d' ' -f1)
           fingerprint=$(printf '%s\n%s\n' "$source_hash" "$recipe_hash" | sha256sum | cut -d' ' -f1)
@@ -64,7 +69,7 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" == schedule ]] && gh release view "$tag" --json isDraft --jq '.isDraft' | grep -qx false; then
             build=false
           fi
-          printf 'matrix=%s\nfingerprint=%s\nbuild=%s\n' "$matrix" "$fingerprint" "$build" >> "$GITHUB_OUTPUT"
+          printf 'matrix=%s\nprofile_matrix=%s\nfingerprint=%s\nbuild=%s\n' "$matrix" "$profile_matrix" "$fingerprint" "$build" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         with:
           name: resolved-inputs
@@ -74,31 +79,18 @@ jobs:
   profile-release:
     needs: resolve
     if: needs.resolve.outputs.build == 'true' && inputs.generate_release_profiles
-    runs-on: ${{ vars.KERNEL_PROFILE_RUNNER || 'ubuntu-26.04' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.profile_matrix) }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
-    outputs:
-      fingerprint: ${{ steps.collect.outputs.fingerprint }}
     env:
-      KERNEL_AUTOFDO_EVENT: ${{ vars.KERNEL_AUTOFDO_EVENT }}
+      TARGET: ${{ matrix.target }}
       UFLINUX_PKGREL: ${{ github.run_number }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Enable profiling runner access to KVM
-        run: |
-          if [[ ! -c /dev/kvm ]]; then
-            echo "::error::This runner has no /dev/kvm device. Set KERNEL_PROFILE_RUNNER to a runner with KVM and guest branch sampling."
-            exit 1
-          fi
-          if [[ "$RUNNER_ENVIRONMENT" == github-hosted && ( ! -r /dev/kvm || ! -w /dev/kvm ) ]]; then
-            sudo chmod a+rw /dev/kvm
-          fi
-          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
-            echo "::error::The runner account needs read and write access to /dev/kvm."
-            ls -l /dev/kvm
-            exit 1
-          fi
       - uses: actions/download-artifact@v8
         with:
           name: resolved-inputs
@@ -106,26 +98,17 @@ jobs:
       - name: Install profiling tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 e2fsprogs linux-perf llvm-22 bolt-22
-      - id: collect
-        name: Collect AutoFDO and BOLT profiles in KVM guests
+          packages=(qemu-system-x86 bolt-22)
+          if [[ "$TARGET" == *aarch64 ]]; then
+            packages=(qemu-system-arm)
+          fi
+          sudo apt-get install -y --no-install-recommends "${packages[@]}" gcc pkg-config libglib2.0-dev llvm-22
+      - name: Collect AutoFDO and BOLT profiles with QEMU TCG
         run: |
-          status=0
-          scripts/collect-release-profiles.sh work/resolved.json work/release-profiles llvm-profgen-22 perf2bolt-22 || status=$?
-          case "$status" in
-            0) ;;
-            78)
-              echo "::warning::The guest PMU rejected a profiling event. The release will use the normal build path and any compatible checked-in profiles."
-              exit 0
-              ;;
-            *) exit "$status" ;;
-          esac
-          fingerprint=$(cd work/release-profiles && sha256sum autofdo.json kernel.afdo bolt.json kernel.fdata | sha256sum | cut -d' ' -f1)
-          printf 'fingerprint=%s\n' "$fingerprint" >> "$GITHUB_OUTPUT"
+          scripts/collect-release-profiles.sh work/resolved.json work/release-profiles llvm-profgen-22 perf2bolt-22 llvm-profdata-22 "$TARGET"
       - uses: actions/upload-artifact@v7
-        if: steps.collect.outputs.fingerprint != ''
         with:
-          name: release-profiles-virt-x86_64
+          name: release-profiles-${{ matrix.target }}
           path: work/release-profiles
           if-no-files-found: error
           overwrite: true
@@ -180,18 +163,18 @@ jobs:
               ;;
           esac
       - uses: actions/download-artifact@v8
-        if: matrix.target == 'virt-x86_64' && needs.profile-release.outputs.fingerprint != ''
+        if: matrix.profile && inputs.generate_release_profiles
         with:
-          name: release-profiles-virt-x86_64
-          path: work/virt-x86_64/profiles
+          name: release-profiles-${{ matrix.target }}
+          path: work/${{ matrix.target }}/profiles
       - name: Build and install-test APK
         env:
-          GENERATED_PROFILES: ${{ needs.profile-release.outputs.fingerprint != '' }}
+          GENERATED_PROFILES: ${{ matrix.profile && inputs.generate_release_profiles }}
         run: |
           args=()
           if [[ "$PROFILE_TARGET" != none ]]; then
             args+=(--profile-build)
-          elif [[ "$GENERATED_PROFILES" == true && "$TARGET" == virt-x86_64 ]]; then
+          elif [[ "$GENERATED_PROFILES" == true && -s "work/$TARGET/profiles/kernel.fdata" ]]; then
             UFLINUX_BOLT_PACKAGE=bolt-22 scripts/prepare-bolt.sh "$TARGET" "work/$TARGET" "work/$TARGET/profiles"
             test -x "work/$TARGET/bolt/llvm-bolt"
           else
@@ -201,11 +184,15 @@ jobs:
             fi
           fi
           scripts/container.sh "$TARGET" work/resolved.json "work/$TARGET" "${args[@]}"
-          if [[ "$GENERATED_PROFILES" == true && "$TARGET" == virt-x86_64 ]]; then
-            jq -e '.autofdo and .bolt' "work/$TARGET/build.json" >/dev/null || {
-              echo "::error::The release kernel did not apply both generated profiles"
+          if [[ "$GENERATED_PROFILES" == true ]]; then
+            jq -e '.autofdo' "work/$TARGET/build.json" >/dev/null || {
+              echo "::error::The release kernel did not apply its generated AutoFDO profile"
               exit 1
             }
+            if [[ -s "work/$TARGET/profiles/kernel.fdata" ]] &&
+               ! jq -e '.bolt' "work/$TARGET/build.json" >/dev/null; then
+              echo "::warning::The release kernel used AutoFDO and BOLT could not optimize the ELF"
+            fi
           fi
       - name: Boot generic and guest kernels
         run: scripts/boot-test.sh "$TARGET" "work/$TARGET"
@@ -308,14 +295,14 @@ jobs:
     if: ${{ !cancelled() && needs.build.result == 'success' && needs.coexist.result == 'success' && github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch && (inputs.profile_target == 'none' || inputs.profile_target == '') }}
     runs-on: ubuntu-26.04
     concurrency:
-      group: kernels-publish-${{ needs.resolve.outputs.fingerprint }}-${{ needs.profile-release.outputs.fingerprint }}
+      group: kernels-publish-${{ needs.resolve.outputs.fingerprint }}
       cancel-in-progress: false
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       FINGERPRINT: ${{ needs.resolve.outputs.fingerprint }}
-      PROFILE_FINGERPRINT: ${{ needs.profile-release.outputs.fingerprint }}
+      GENERATED_PROFILES: ${{ inputs.generate_release_profiles }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -329,6 +316,11 @@ jobs:
         with:
           name: resolved-inputs
           path: work
+      - uses: actions/download-artifact@v8
+        if: inputs.generate_release_profiles
+        with:
+          pattern: release-profiles-*
+          path: work/release-profiles
       - name: Check release assets
         run: |
           shopt -s nullglob
@@ -343,7 +335,8 @@ jobs:
           done
           test -s dist/source-apk-zstd.tar.gz
           cp work/resolved.json dist/
-          if [[ -n "$PROFILE_FINGERPRINT" ]]; then
+          if [[ "$GENERATED_PROFILES" == true ]]; then
+            PROFILE_FINGERPRINT=$(cd work/release-profiles && sha256sum -- */*.json */kernel.* | sha256sum | cut -d' ' -f1)
             FINGERPRINT=$(printf '%s\n%s\n' "$FINGERPRINT" "$PROFILE_FINGERPRINT" | sha256sum | cut -d' ' -f1)
             printf 'FINGERPRINT=%s\n' "$FINGERPRINT" >> "$GITHUB_ENV"
           fi
