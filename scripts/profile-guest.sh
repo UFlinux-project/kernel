@@ -1,5 +1,7 @@
 #!/bin/sh
+# shellcheck shell=busybox
 set -eu
+set -o pipefail
 export PATH=/sbin:/usr/sbin:/bin:/usr/bin
 
 if [ "${1:-}" = workload ]; then
@@ -18,8 +20,14 @@ if [ "${1:-}" = workload ]; then
     exit 0
 fi
 
+profile_failed() {
+    echo "UFLINUX_PROFILE_FAILED (exit $1)" >&2
+    poweroff -f
+}
+trap 'profile_failed "$?"' EXIT
 grep -qs ' /proc proc ' /proc/mounts || mount -t proc proc /proc
 grep -qs ' /sys sysfs ' /proc/mounts || mount -t sysfs sysfs /sys
+mount -o remount,rw /
 {
     IFS= read -r mode
     IFS= read -r event
@@ -30,7 +38,11 @@ case "$mode" in
     *) exit 2 ;;
 esac
 perf record -a "$@" -o /kernel.perf.data -- "$0" workload
-perf script -i /kernel.perf.data -F brstack | awk 'NF { samples++ } END { exit !samples }'
+if ! perf script -i /kernel.perf.data -F brstack | awk 'NF { samples++ } END { exit !samples }'; then
+    echo "perf did not produce readable branch samples for $mode" >&2
+    exit 1
+fi
 sync
 echo UFLINUX_PROFILE_OK
-poweroff -f
+trap - EXIT
+exec poweroff -f
