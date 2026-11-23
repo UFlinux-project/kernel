@@ -36,7 +36,7 @@ For BOLT, profile the exact baseline x86_64 kernel, following the [LLVM BOLT ker
 
 To generate profiles during a full release, dispatch the workflow on the default branch with `profile_target=none` and `generate_release_profiles=true`. The **profile-release** job collects AutoFDO data for `virt-x86_64`, rebuilds that target with AutoFDO, then collects BOLT data from the linked kernel. Both passes run mixed block I/O and loopback TCP in a KVM guest. The release build uses the resulting workflow artifact and checks that both optimizations were applied.
 
-The profiling runner needs Ubuntu 26.04, Docker, KVM, and a CPU and hypervisor that expose branch recording to the guest. The workflow enables access to an existing `/dev/kvm` on GitHub-hosted runners. If the hosted runner lacks KVM or guest branch counters, set `KERNEL_PROFILE_RUNNER` to the label of a compatible runner. On a self-hosted runner, grant the runner account read and write access to the device. The default AutoFDO event is Intel's `br_inst_retired.near_taken:k`. Set `KERNEL_AUTOFDO_EVENT` to the appropriate `perf` event for another supported CPU.
+The profiling runner needs Ubuntu 26.04, Docker, KVM, and a CPU and hypervisor that expose branch recording to the guest. The workflow enables access to an existing `/dev/kvm` on GitHub-hosted runners. If the hosted runner lacks KVM or guest branch counters, set `KERNEL_PROFILE_RUNNER` to the label of a compatible runner. On a self-hosted runner, grant the runner account read and write access to the device. The default AutoFDO event is `r20c4:k`, the raw encoding of Intel's `BR_INST_RETIRED.NEAR_TAKEN` for kernel samples. Set `KERNEL_AUTOFDO_EVENT` to the appropriate `perf` event for another supported CPU.
 
 ## Publish and install
 

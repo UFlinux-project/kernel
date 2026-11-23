@@ -22,7 +22,9 @@ fi
 workspace=$(mktemp -d "$(dirname "$resolved")/profile.XXXXXX")
 trap 'sudo rm -rf -- "$workspace"' EXIT
 mkdir -p "$profiles"
-export KERNEL_AUTOFDO_EVENT=${KERNEL_AUTOFDO_EVENT:-br_inst_retired.near_taken:k}
+# Intel BR_INST_RETIRED.NEAR_TAKEN (event 0xc4, umask 0x20).
+# Use the raw encoding so perf need not recognize the guest CPU's event alias.
+export KERNEL_AUTOFDO_EVENT=${KERNEL_AUTOFDO_EVENT:-r20c4:k}
 
 for mode in autofdo bolt; do
     output="$workspace/$mode"
