@@ -7,8 +7,15 @@ profgen=${3:?Specify llvm-profgen}
 perf2bolt=${4:?Specify perf2bolt}
 target=virt-x86_64
 
-if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
-    echo "Kernel profiling requires a runner with KVM and guest branch sampling" >&2
+if [[ ! -c /dev/kvm || ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+    echo "Kernel profiling requires read and write access to the /dev/kvm device" >&2
+    exit 1
+fi
+if ! printf '%s\n' '{"execute":"qmp_capabilities"}' '{"execute":"query-kvm"}' '{"execute":"quit"}' |
+    timeout 15 qemu-system-x86_64 -machine q35,accel=kvm -cpu host,pmu=on \
+        -S -nodefaults -display none -m 128 -qmp stdio |
+    jq -es 'any(.[]; .return.enabled? == true)' >/dev/null; then
+    echo "QEMU could not initialize KVM on this profiling runner" >&2
     exit 1
 fi
 
