@@ -48,6 +48,11 @@ for mode in autofdo bolt; do
         -append "console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=/sbin/uflinux-profile panic=1" \
         2>&1 | tee "$workspace/guest.log"
     if ! grep -q '^UFLINUX_PROFILE_OK' "$workspace/guest.log"; then
+        if grep -q '^UFLINUX_PROFILE_FAILED' "$workspace/guest.log" &&
+            grep -Eq '^The .+ event is not supported\.[[:space:]]*$' "$workspace/guest.log"; then
+            echo "The guest PMU does not support the requested $mode event" >&2
+            exit 78
+        fi
         echo "The guest did not complete profiling. Check perf errors and guest PMU support." >&2
         exit 1
     fi

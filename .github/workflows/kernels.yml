@@ -28,10 +28,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: kernels-${{ github.event_name == 'pull_request' && github.ref || 'release' }}
-  cancel-in-progress: false
-
 jobs:
   resolve:
     runs-on: ubuntu-26.04
@@ -114,10 +110,20 @@ jobs:
       - id: collect
         name: Collect AutoFDO and BOLT profiles in KVM guests
         run: |
-          scripts/collect-release-profiles.sh work/resolved.json work/release-profiles llvm-profgen-22 perf2bolt-22
+          status=0
+          scripts/collect-release-profiles.sh work/resolved.json work/release-profiles llvm-profgen-22 perf2bolt-22 || status=$?
+          case "$status" in
+            0) ;;
+            78)
+              echo "::warning::The guest PMU rejected a profiling event. The release will use the normal build path and any compatible checked-in profiles."
+              exit 0
+              ;;
+            *) exit "$status" ;;
+          esac
           fingerprint=$(cd work/release-profiles && sha256sum autofdo.json kernel.afdo bolt.json kernel.fdata | sha256sum | cut -d' ' -f1)
           printf 'fingerprint=%s\n' "$fingerprint" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
+        if: steps.collect.outputs.fingerprint != ''
         with:
           name: release-profiles-virt-x86_64
           path: work/release-profiles
@@ -169,18 +175,18 @@ jobs:
               ;;
           esac
       - uses: actions/download-artifact@v8
-        if: matrix.target == 'virt-x86_64' && inputs.generate_release_profiles
+        if: matrix.target == 'virt-x86_64' && needs.profile-release.outputs.fingerprint != ''
         with:
           name: release-profiles-virt-x86_64
           path: work/virt-x86_64/profiles
       - name: Build and install-test APK
         env:
-          GENERATE_PROFILES: ${{ inputs.generate_release_profiles }}
+          GENERATED_PROFILES: ${{ needs.profile-release.outputs.fingerprint != '' }}
         run: |
           args=()
           if [[ "$PROFILE_TARGET" != none ]]; then
             args+=(--profile-build)
-          elif [[ "$GENERATE_PROFILES" == true && "$TARGET" == virt-x86_64 ]]; then
+          elif [[ "$GENERATED_PROFILES" == true && "$TARGET" == virt-x86_64 ]]; then
             UFLINUX_BOLT_PACKAGE=bolt-22 scripts/prepare-bolt.sh "$TARGET" "work/$TARGET" "work/$TARGET/profiles"
             test -x "work/$TARGET/bolt/llvm-bolt"
           else
@@ -190,7 +196,7 @@ jobs:
             fi
           fi
           scripts/container.sh "$TARGET" work/resolved.json "work/$TARGET" "${args[@]}"
-          if [[ "$GENERATE_PROFILES" == true && "$TARGET" == virt-x86_64 ]]; then
+          if [[ "$GENERATED_PROFILES" == true && "$TARGET" == virt-x86_64 ]]; then
             jq -e '.autofdo and .bolt' "work/$TARGET/build.json" >/dev/null || {
               echo "::error::The release kernel did not apply both generated profiles"
               exit 1
@@ -296,6 +302,9 @@ jobs:
     needs: [resolve, profile-release, build, coexist]
     if: ${{ !cancelled() && needs.build.result == 'success' && needs.coexist.result == 'success' && github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch && (inputs.profile_target == 'none' || inputs.profile_target == '') }}
     runs-on: ubuntu-26.04
+    concurrency:
+      group: kernels-publish-${{ needs.resolve.outputs.fingerprint }}-${{ needs.profile-release.outputs.fingerprint }}
+      cancel-in-progress: false
     permissions:
       contents: write
     env:
