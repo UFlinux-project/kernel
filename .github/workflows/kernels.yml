@@ -136,7 +136,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: >-
+      ${{ matrix.runner == 'ubuntu-26.04-arm'
+          && github.event_name != 'pull_request'
+          && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+          && vars.KERNEL_AARCH64_BUILD_RUNNER
+          || matrix.runner }}
     timeout-minutes: 300
     env:
       TARGET: ${{ matrix.target }}

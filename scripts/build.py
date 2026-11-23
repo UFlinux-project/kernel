@@ -80,6 +80,21 @@ def bbr_default(kernel, name, symbol):
     return selector
 
 
+def enable_arm64_autofdo(kernel):
+    # Older vendor trees still require the architecture opt-in for AutoFDO.
+    if not re.search(r"^\s*depends on ARCH_SUPPORTS_AUTOFDO_CLANG\s*$",
+                     (kernel / "arch/Kconfig").read_text(), re.M):
+        return
+    kconfig = kernel / "arch/arm64/Kconfig"
+    text = kconfig.read_text()
+    opt_in = "\tselect ARCH_SUPPORTS_AUTOFDO_CLANG\n"
+    if opt_in not in text:
+        marker = "\tselect ARCH_SUPPORTS_LTO_CLANG_THIN\n"
+        if text.count(marker) != 1:
+            raise SystemExit("ARM64 AutoFDO Kconfig layout changed")
+        kconfig.write_text(text.replace(marker, marker + opt_in))
+
+
 def configure(kernel, obj, target, name, kbuild, bbr, autofdo, gcc=False):
     config = obj / ".config"
     if "config_url" in target:
@@ -167,15 +182,22 @@ if [ -n "${UFLINUX_BOLT_PROFILE:-}" ]; then
     bolt_input=${VMLINUX:-vmlinux}
     build_id=$(readelf -n "$bolt_input" | awk '/Build ID:/ {print $3; exit}')
     if [ -n "$build_id" ] && [ "$build_id" = "$UFLINUX_BOLT_BUILD_ID" ]; then
+        # Require BOLT's kernel rewriter, including on ARM64 where upstream
+        # releases can recognize the ELF architecture without supporting the kernel.
+        bolt_log="$bolt_input.bolt.log"
         if llvm-bolt "$bolt_input" -o "$bolt_input.bolt" --data "$UFLINUX_BOLT_PROFILE" \
-            --eliminate-unreachable=0 --reorder-blocks=ext-tsp \
-            --simplify-conditional-tail-calls=0 --skip-funcs=__entry_text_start,irq_entries_start; then
+            --relocs=0 --eliminate-unreachable=0 --reorder-blocks=ext-tsp \
+            --simplify-conditional-tail-calls=0 --skip-funcs=__entry_text_start,irq_entries_start \
+            >"$bolt_log" 2>&1 && [ -s "$bolt_input.bolt" ] &&
+            grep -qx 'BOLT-INFO: Linux kernel binary detected' "$bolt_log"; then
             mv "$bolt_input.bolt" "$bolt_input"
             touch .uflinux-bolt-applied
         else
             rm -f "$bolt_input.bolt"
-            echo "BOLT failed, using the linked vmlinux" >&2
+            echo "BOLT could not optimize this Linux kernel, using the linked vmlinux" >&2
         fi
+        cat "$bolt_log"
+        rm -f "$bolt_log"
     fi
 fi
 '''
@@ -271,6 +293,8 @@ def main():
     kbuild = ["make", "-C", str(kernel), f"O={obj}", f"ARCH={target['arch']}", "LOCALVERSION=", *toolchain]
     afdo, afdo_data = profile(name, "autofdo", target)
     bolt, bolt_data = profile(name, "bolt", target)
+    if target["arch"] == "arm64" and (afdo or args.profile_build):
+        enable_arm64_autofdo(kernel)
     settings = configure(kernel, obj, target, name, kbuild, bbr, bool(afdo) or args.profile_build, gcc)
     baseline_config = hashlib.sha256((obj / ".config").read_bytes()).hexdigest()
     if afdo and afdo_data.get("config_sha256") != baseline_config:
@@ -280,7 +304,8 @@ def main():
         kbuild.append(f"CLANG_AUTOFDO_PROFILE={afdo}")
     else:
         afdo = None
-    if bolt and not args.profile_build and target["apk"] == "x86_64" and bolt_data.get("build_id") and shutil.which("llvm-bolt") and bolt_hook(kernel):
+    if (bolt and not args.profile_build and target["apk"] in {"x86_64", "aarch64"}
+            and bolt_data.get("build_id") and shutil.which("llvm-bolt") and bolt_hook(kernel)):
         os.environ.update(UFLINUX_BOLT_PROFILE=str(bolt), UFLINUX_BOLT_BUILD_ID=bolt_data["build_id"])
     compression = {
         "zram": ("ZRAM", "ZRAM_DEF_COMP", "CRYPTO_LZ4", "CRYPTO_ZSTD"),
@@ -328,7 +353,7 @@ def main():
     if not afdo:
         omissions["AutoFDO"] = "No compatible UFlinux sample profile or Kconfig support"
     if not bolt_applied:
-        omissions["BOLT"] = "No supported x86_64 kernel hook, LLVM BOLT tool, or exact matching profile"
+        omissions["BOLT"] = "No compatible Linux kernel rewriter or exact matching profile, or BOLT failed"
     if settings.get("LTO_CLANG_THIN_DIST") != "y":
         omissions["Distributed ThinLTO"] = "Unavailable in the effective Kconfig"
     if settings.get("LRU_GEN_ENABLED") != "y":

@@ -1,0 +1,21 @@
+Subject: [PATCH] kbuild: Add '-fno-builtin-wcslen'
+
+Backport Linux commit 84ffc79bfbf70c779e60218563f2f3ad45288671
+by Nathan Chancellor to the Orange Pi vendor tree.
+
+Clang can turn the scan in UniStrcat() into a call to wcslen().
+The kernel has no such symbol, so linking vmlinux fails when the
+SMB client inlines UniStrcat() into alloc_path_with_tree_prefix().
+
+diff --git a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -1004,5 +1004,8 @@ ifdef CONFIG_CC_IS_GCC
+ KBUILD_CFLAGS   += -fconserve-stack
+ endif
+ 
++# Ensure compilers do not transform certain loops into calls to wcslen()
++KBUILD_CFLAGS += -fno-builtin-wcslen
++
+ # change __FILE__ to the relative path from the srctree
+ KBUILD_CPPFLAGS += $(call cc-option,-fmacro-prefix-map=$(srctree)/=)
