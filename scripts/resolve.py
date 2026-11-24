@@ -151,6 +151,27 @@ def toolchain(alpine, arch):
     return {"major": major, "versions": packages}
 
 
+def llvm():
+    """Latest stable LLVM release used to build the BOLT kernel rewriter."""
+    releases = github("llvm/llvm-project/releases?per_page=30")
+    stable = {}
+    for release in releases:
+        match = re.fullmatch(r"llvmorg-(\d+)\.(\d+)\.(\d+)", release["tag_name"])
+        if not match or release["prerelease"] or release["draft"]:
+            continue
+        stable[tuple(int(part) for part in match.groups())] = release
+    if not stable:
+        raise ValueError("No stable LLVM release found")
+    numbers, release = max(stable.items())
+    version = ".".join(str(part) for part in numbers)
+    archive = f"llvm-project-{version}.src.tar.xz"
+    digests = {asset["name"]: asset.get("digest", "") for asset in release["assets"]}
+    if not digests.get(archive, "").startswith("sha256:"):
+        raise ValueError(f"LLVM {version} source archive has no published checksum")
+    return {"version": version, "major": numbers[0], "archive": archive,
+            "sha256": digests[archive].split(":", 1)[1]}
+
+
 def topic_patch(series):
     repo = "CachyOS/linux"
     ref = urllib.parse.quote(f"{series}/bbr3", safe="")
@@ -215,7 +236,7 @@ def resolve(selected=None):
             target["config_url"] = raw("alpinelinux/aports", aports, f"main/linux-lts/{target['config']}")
         target["alpine"] = alpine[target["apk"]]
         target["builder"] = "aarch64" if target["arch"] == "arm64" else "x86_64"
-    return {"targets": targets, "alpine": alpine, "aports": aports,
+    return {"targets": targets, "alpine": alpine, "aports": aports, "llvm": llvm(),
             "toolchains": {arch: toolchain(alpine[arch], arch) for arch in ("x86_64", "aarch64")}}
 
 

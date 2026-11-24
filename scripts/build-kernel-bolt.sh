@@ -3,10 +3,12 @@ set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
 output=$(realpath -m "${1:?Specify the BOLT installation directory}")
-version=23.1.6
-llvm_config=llvm-config-23
-archive=llvm-project-$version.src.tar.xz
-sha256=d3b86ab29cfb4445a6652e5c2642ccc75e04e38084dde3701d323320f35a31da
+resolved=$(realpath -m "${2:?Specify resolved.json from scripts/resolve.py}")
+version=$(jq -er '.llvm.version' "$resolved")
+sha256=$(jq -er '.llvm.sha256' "$resolved")
+archive=$(jq -er '.llvm.archive' "$resolved")
+major=${version%%.*}
+llvm_config=llvm-config-$major
 
 if [[ $("$llvm_config" --version) != "$version" ]]; then
     echo "Building the kernel rewriter requires LLVM $version development files" >&2
@@ -26,7 +28,7 @@ git -C "$workspace" apply "$repo/patches/llvm-bolt/linux-kernel.patch"
 
 cmake -S "$workspace/bolt" -B "$workspace/build" -G Ninja \
     -DLLVM_DIR="$("$llvm_config" --cmakedir)" -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER=clang-23 -DCMAKE_CXX_COMPILER=clang++-23 \
+    -DCMAKE_C_COMPILER=clang-$major -DCMAKE_CXX_COMPILER=clang++-$major \
     -DLLVM_INCLUDE_TESTS=OFF -DLLVM_LINK_LLVM_DYLIB=ON -DBOLT_ENABLE_RUNTIME=OFF \
     -DBOLT_TARGETS_TO_BUILD=X86
 cmake --build "$workspace/build" --target llvm-bolt --parallel "${UFLINUX_BOLT_JOBS:-4}"

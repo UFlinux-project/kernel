@@ -99,26 +99,28 @@ jobs:
           path: work
       - name: Install profiling tools
         run: |
-          packages=(qemu-system-x86 cmake ninja-build llvm-23-dev clang-23 g++ libzstd-dev zlib1g-dev)
+          major=$(jq -er '.llvm.major' work/resolved.json)
+          packages=(qemu-system-x86 cmake ninja-build "llvm-$major-dev" "clang-$major" g++ libzstd-dev zlib1g-dev)
           if [[ "$TARGET" == *aarch64 ]]; then
             packages=(qemu-system-arm)
           fi
-          # Ubuntu ships LLVM 22; the toolchain must match the latest stable release.
+          # Ubuntu ships an older LLVM; the toolchain must match the resolved release.
           codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
               sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
-          echo "deb https://apt.llvm.org/$codename llvm-toolchain-$codename-23 main" |
-              sudo tee /etc/apt/sources.list.d/llvm-23.list > /dev/null
+          echo "deb https://apt.llvm.org/$codename llvm-toolchain-$codename-$major main" |
+              sudo tee /etc/apt/sources.list.d/llvm-$major.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends "${packages[@]}" gcc pkg-config libglib2.0-dev llvm-23
+          sudo apt-get install -y --no-install-recommends "${packages[@]}" gcc pkg-config libglib2.0-dev "llvm-$major"
       - name: Collect AutoFDO and BOLT profiles with QEMU TCG
         env:
           AARCH64_BOLT_RUNNER: ${{ vars.KERNEL_AARCH64_BOLT_RUNNER }}
         run: |
+          major=$(jq -er '.llvm.major' work/resolved.json)
           bolt=
           case "$TARGET" in
             *x86_64)
-              scripts/build-kernel-bolt.sh work/kernel-bolt
+              scripts/build-kernel-bolt.sh work/kernel-bolt work/resolved.json
               bolt="$PWD/work/kernel-bolt/llvm-bolt"
               ;;
             *aarch64)
@@ -132,7 +134,7 @@ jobs:
           if [[ -n "$bolt" ]]; then
             UFLINUX_BOLT_BINARY="$bolt" scripts/prepare-bolt.sh "$TARGET" work/release-profiles --bundle
           fi
-          scripts/collect-release-profiles.sh work/resolved.json work/release-profiles llvm-profgen-23 "$bolt" llvm-profdata-23 "$TARGET"
+          scripts/collect-release-profiles.sh work/resolved.json work/release-profiles "llvm-profgen-$major" "$bolt" "llvm-profdata-$major" "$TARGET"
       - uses: actions/upload-artifact@v7
         with:
           name: release-profiles-${{ matrix.target }}
