@@ -1,7 +1,7 @@
 diff --git a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp b/bolt/lib/Rewrite/LinuxKernelRewriter.cpp
 --- a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp
 +++ b/bolt/lib/Rewrite/LinuxKernelRewriter.cpp
-@@ -89,6 +89,11 @@
+@@ -89,6 +89,11 @@ static cl::opt<bool>
               cl::desc("print ORC unwind information for instructions"),
               cl::init(true), cl::Hidden, cl::cat(BoltCategory));
  
@@ -13,7 +13,7 @@ diff --git a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp b/bolt/lib/Rewrite/LinuxKe
  } // namespace opts
  
  /// Linux kernel version
-@@ -270,7 +275,6 @@
+@@ -268,7 +273,6 @@ class LinuxKernelRewriter final : public MetadataRewriter {
    ErrorOr<BinarySection &> BugTableSection = std::errc::bad_address;
  
    /// Size of bug_entry struct.
@@ -21,7 +21,7 @@ diff --git a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp b/bolt/lib/Rewrite/LinuxKe
  
    /// List of bug entries per function.
    using FunctionBugListType =
-@@ -322,6 +326,7 @@
+@@ -320,6 +324,7 @@ class LinuxKernelRewriter final : public MetadataRewriter {
    Error rewriteParaInstructions();
  
    /// __bug_table section handling.
@@ -29,7 +29,7 @@ diff --git a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp b/bolt/lib/Rewrite/LinuxKe
    Error readBugTable();
    Error rewriteBugTable();
  
-@@ -353,6 +358,9 @@
+@@ -351,6 +356,9 @@ public:
  
      processLKSections();
  
@@ -39,7 +39,7 @@ diff --git a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp b/bolt/lib/Rewrite/LinuxKe
      if (Error E = processSMPLocks())
        return E;
  
-@@ -478,8 +486,9 @@
+@@ -476,8 +484,9 @@ void LinuxKernelRewriter::processLKKSymtab(bool IsGPL) {
      SectionName = "__ksymtab_gpl";
    ErrorOr<BinarySection &> SectionOrError =
        BC.getUniqueSectionByName(SectionName);
@@ -51,7 +51,7 @@ diff --git a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp b/bolt/lib/Rewrite/LinuxKe
    const uint64_t SectionSize = SectionOrError->getSize();
    const uint64_t SectionAddress = SectionOrError->getAddress();
    assert((SectionSize % 4) == 0 &&
-@@ -500,6 +509,76 @@
+@@ -498,6 +507,75 @@ void LinuxKernelRewriter::processLKKSymtab(bool IsGPL) {
    }
  }
  
@@ -71,8 +71,7 @@ diff --git a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp b/bolt/lib/Rewrite/LinuxKe
 +      return createStringError(errc::executable_format_error,
 +                               "invalid patch-site table %s", Name.str().c_str());
 +    AddressExtractor AE(Section.getContents(), Section.getAddress(),
-+                        BC.AsmInfo->isLittleEndian(),
-+                        BC.AsmInfo->getCodePointerSize());
++                        BC.AsmInfo->isLittleEndian());
 +    AddressExtractor::Cursor Cursor(0);
 +    while (Cursor.tell() < Section.getSize()) {
 +      const uint64_t Offset = Cursor.tell();
@@ -128,7 +127,7 @@ diff --git a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp b/bolt/lib/Rewrite/LinuxKe
  /// .smp_locks section contains PC-relative references to instructions with LOCK
  /// prefix. The prefix can be converted to NOP at boot time on non-SMP systems.
  Error LinuxKernelRewriter::processSMPLocks() {
-@@ -1312,7 +1391,9 @@
+@@ -1306,7 +1384,9 @@ Error LinuxKernelRewriter::readBugTable() {
    if (!BugTableSection)
      return Error::success();
  
@@ -139,7 +138,7 @@ diff --git a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp b/bolt/lib/Rewrite/LinuxKe
      return createStringError(errc::executable_format_error,
                               "bug table size error");
  
-@@ -1324,7 +1405,7 @@
+@@ -1318,7 +1398,7 @@ Error LinuxKernelRewriter::readBugTable() {
    while (Cursor && Cursor.tell() < BugTableSection->getSize()) {
      const uint64_t Pos = Cursor.tell();
      const uint64_t InstAddress = AE.getPCRelAddress32(Cursor);
@@ -148,7 +147,7 @@ diff --git a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp b/bolt/lib/Rewrite/LinuxKe
  
      if (!Cursor)
        return createStringError(errc::executable_format_error,
-@@ -1384,7 +1465,7 @@
+@@ -1378,7 +1458,7 @@ Error LinuxKernelRewriter::rewriteBugTable() {
          // Create a relocation entry for this bug entry.
          MCSymbol *Label =
              BC.MIB->getOrCreateInstLabel(Inst, "__BUG_", BC.Ctx.get());
@@ -157,7 +156,7 @@ diff --git a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp b/bolt/lib/Rewrite/LinuxKe
          BugTableSection->addRelocation(EntryOffset, Label, ELF::R_X86_64_PC32,
                                         /*Addend*/ 0);
        }
-@@ -1394,7 +1475,7 @@
+@@ -1388,7 +1468,7 @@ Error LinuxKernelRewriter::rewriteBugTable() {
      // result of DCE, but setting their instruction address to zero.
      for (const uint32_t ID : FunctionBugList[&BF]) {
        if (!EmittedIDs.count(ID)) {
@@ -169,7 +168,7 @@ diff --git a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp b/bolt/lib/Rewrite/LinuxKe
 diff --git a/bolt/lib/Rewrite/RewriteInstance.cpp b/bolt/lib/Rewrite/RewriteInstance.cpp
 --- a/bolt/lib/Rewrite/RewriteInstance.cpp
 +++ b/bolt/lib/Rewrite/RewriteInstance.cpp
-@@ -1402,7 +1402,24 @@
+@@ -1432,7 +1432,24 @@ void RewriteInstance::discoverFileObjects() {
      }
    }
  
