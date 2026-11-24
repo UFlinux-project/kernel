@@ -112,6 +112,10 @@ def configure(kernel, obj, target, name, kbuild, bbr, autofdo, gcc=False):
 
     algorithm, symbol = bbr
     selector = bbr_default(kernel, algorithm, symbol)
+    crypto = ("CRYPTO", "CRYPTO_HMAC", "CRYPTO_MD5", "CRYPTO_SHA3", "CRYPTO_ECDSA", "CRYPTO_CRC32C",
+              "CRYPTO_BLAKE2B")
+    if re.search(r"^config CRYPTO_MLDSA\b", (kernel / "crypto/Kconfig").read_text(), re.M):
+        crypto += ("CRYPTO_MLDSA",)
     set_config("--set-str", "LOCALVERSION", f"-uflinux-{name}", "-d", "LOCALVERSION_AUTO",
                "-e", "MODULES", "-d", "MODULE_SIG", "-d", "MODULE_SIG_ALL", "--set-str", "SYSTEM_TRUSTED_KEYS", "",
                "--set-str", "SYSTEM_REVOCATION_KEYS", "", "-d", "WERROR", "-d", "RUST",
@@ -121,7 +125,8 @@ def configure(kernel, obj, target, name, kbuild, bbr, autofdo, gcc=False):
                "-e", "ZSWAP_COMPRESSOR_DEFAULT_ZSTD", "-e", "CRYPTO_LZ4", "-e", "CRYPTO_ZSTD",
                "-m", "ZRAM", "-e", "ZRAM_BACKEND_LZ4", "-e", "ZRAM_BACKEND_ZSTD",
                "-e", "ZRAM_DEF_COMP_ZSTD", "-m", "F2FS_FS", "-e", "F2FS_FS_COMPRESSION",
-               "-e", "F2FS_FS_LZ4", "-e", "F2FS_FS_ZSTD")
+               "-e", "F2FS_FS_LZ4", "-e", "F2FS_FS_ZSTD",
+               *(option for key in crypto for option in ("-e", key)))
     if name == "rpi":
         set_config("-e", "ARM64_4K_PAGES")
     virt = name.startswith("virt-")
@@ -148,6 +153,9 @@ def configure(kernel, obj, target, name, kbuild, bbr, autofdo, gcc=False):
     effective = normalize()
     if effective.get(symbol) != "y" or effective.get("DEFAULT_TCP_CONG") != f'"{algorithm}"':
         raise SystemExit("BBRv3 was not built in as the default TCP congestion control")
+    missing_crypto = [f"CONFIG_{key}" for key in crypto if effective.get(key) != "y"]
+    if missing_crypto:
+        raise SystemExit(f"{name}: required crypto options are not built in: {', '.join(missing_crypto)}")
     expected_i915 = name == "x86_64"
     if (expected_i915 and effective.get("DRM_I915") != "m") or (
             not expected_i915 and effective.get("DRM_I915") in {"y", "m"}):
