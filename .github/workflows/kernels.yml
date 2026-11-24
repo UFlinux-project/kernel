@@ -99,12 +99,18 @@ jobs:
           path: work
       - name: Install profiling tools
         run: |
-          sudo apt-get update
-          packages=(qemu-system-x86 cmake ninja-build llvm-22-dev clang-22 g++ libzstd-dev zlib1g-dev)
+          packages=(qemu-system-x86 cmake ninja-build llvm-23-dev clang-23 g++ libzstd-dev zlib1g-dev)
           if [[ "$TARGET" == *aarch64 ]]; then
             packages=(qemu-system-arm)
           fi
-          sudo apt-get install -y --no-install-recommends "${packages[@]}" gcc pkg-config libglib2.0-dev llvm-22
+          # Ubuntu ships LLVM 22; the toolchain must match the latest stable release.
+          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
+              sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
+          echo "deb https://apt.llvm.org/$codename llvm-toolchain-$codename-23 main" |
+              sudo tee /etc/apt/sources.list.d/llvm-23.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "${packages[@]}" gcc pkg-config libglib2.0-dev llvm-23
       - name: Collect AutoFDO and BOLT profiles with QEMU TCG
         env:
           AARCH64_BOLT_RUNNER: ${{ vars.KERNEL_AARCH64_BOLT_RUNNER }}
@@ -126,7 +132,7 @@ jobs:
           if [[ -n "$bolt" ]]; then
             UFLINUX_BOLT_BINARY="$bolt" scripts/prepare-bolt.sh "$TARGET" work/release-profiles --bundle
           fi
-          scripts/collect-release-profiles.sh work/resolved.json work/release-profiles llvm-profgen-22 "$bolt" llvm-profdata-22 "$TARGET"
+          scripts/collect-release-profiles.sh work/resolved.json work/release-profiles llvm-profgen-23 "$bolt" llvm-profdata-23 "$TARGET"
       - uses: actions/upload-artifact@v7
         with:
           name: release-profiles-${{ matrix.target }}
