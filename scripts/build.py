@@ -127,7 +127,7 @@ def configure(kernel, obj, target, name, kbuild, bbr, autofdo, gcc=False):
     virt = name.startswith("virt-")
     for driver in ("DRM_AMDGPU", "DRM_RADEON", "DRM_NOUVEAU", "DRM_XE"):
         set_config("-d" if virt else "-m", driver)
-    set_config("-m" if name in {"x86", "x86_64"} else "-d", "DRM_I915")
+    set_config("-m" if name == "x86_64" else "-d", "DRM_I915")
     if virt:
         set_config("-e", "PCI", "-e", "EFI", "-e", "EFI_STUB", "-e", "VIRTIO_PCI",
                    "-e", "VIRTIO_MMIO", "-e", "VIRTIO_BLK", "-e", "SCSI", "-e", "BLK_DEV_SD",
@@ -148,7 +148,7 @@ def configure(kernel, obj, target, name, kbuild, bbr, autofdo, gcc=False):
     effective = normalize()
     if effective.get(symbol) != "y" or effective.get("DEFAULT_TCP_CONG") != f'"{algorithm}"':
         raise SystemExit("BBRv3 was not built in as the default TCP congestion control")
-    expected_i915 = name in {"x86", "x86_64"}
+    expected_i915 = name == "x86_64"
     if (expected_i915 and effective.get("DRM_I915") != "m") or (
             not expected_i915 and effective.get("DRM_I915") in {"y", "m"}):
         raise SystemExit("Unexpected i915 configuration")
@@ -171,25 +171,41 @@ def profile(name, kind, target):
     return path, data
 
 
-def bolt_hook(kernel):
+def bolt_hook(kernel, x86):
     script = kernel / "scripts/link-vmlinux.sh"
     text = script.read_text()
     marker = "# For fixdep"
     if text.count(marker) != 1:
         return False
+    if x86:
+        recipe = kernel / "arch/x86/boot/compressed/Makefile"
+        recipe_text = recipe.read_text()
+        relocs = "$(CMD_RELOCS) $< > $@;$(CMD_RELOCS) --abs-relocs $<"
+        if recipe_text.count(relocs) != 1:
+            return False
+        # BOLT drops static relocations. The patched x86 rewriter leaves
+        # the runtime relocation sites at their original addresses.
+        recipe.write_text(recipe_text.replace(
+            relocs,
+            'input="$<"; if [ -f "$<.pre-bolt" ]; then input="$<.pre-bolt"; fi; '
+            '$(CMD_RELOCS) "$$input" > $@;$(CMD_RELOCS) --abs-relocs "$$input"'))
     block = r'''
 if [ -n "${UFLINUX_BOLT_PROFILE:-}" ]; then
     bolt_input=${VMLINUX:-vmlinux}
+    rm -f "$bolt_input.pre-bolt" .uflinux-bolt-applied
     build_id=$(readelf -n "$bolt_input" | awk '/Build ID:/ {print $3; exit}')
     if [ -n "$build_id" ] && [ "$build_id" = "$UFLINUX_BOLT_BUILD_ID" ]; then
-        # Require BOLT's kernel rewriter, including on ARM64 where upstream
-        # releases can recognize the ELF architecture without supporting the kernel.
         bolt_log="$bolt_input.bolt.log"
         if llvm-bolt "$bolt_input" -o "$bolt_input.bolt" --data "$UFLINUX_BOLT_PROFILE" \
+            ${UFLINUX_BOLT_X86_BUG_SIZE:+--linux-bug-entry-size="$UFLINUX_BOLT_X86_BUG_SIZE"} \
             --relocs=0 --eliminate-unreachable=0 --reorder-blocks=ext-tsp \
             --simplify-conditional-tail-calls=0 --skip-funcs=__entry_text_start,irq_entries_start \
             >"$bolt_log" 2>&1 && [ -s "$bolt_input.bolt" ] &&
-            grep -qx 'BOLT-INFO: Linux kernel binary detected' "$bolt_log"; then
+            grep -Fxq 'BOLT-INFO: Linux kernel binary detected' "$bolt_log" &&
+            readelf -SW "$bolt_input.bolt" | grep -F '.note.bolt_info' >/dev/null; then
+            if [ -n "${UFLINUX_BOLT_X86_BUG_SIZE:-}" ]; then
+                mv "$bolt_input" "$bolt_input.pre-bolt"
+            fi
             mv "$bolt_input.bolt" "$bolt_input"
             touch .uflinux-bolt-applied
         else
@@ -198,11 +214,21 @@ if [ -n "${UFLINUX_BOLT_PROFILE:-}" ]; then
         fi
         cat "$bolt_log"
         rm -f "$bolt_log"
+    else
+        echo "BOLT profile build ID $UFLINUX_BOLT_BUILD_ID does not match $bolt_input (${build_id:-no build ID})" >&2
     fi
 fi
 '''
     script.write_text(text.replace(marker, block + "\n" + marker))
     return True
+
+
+def x86_bug_entry_size(kernel, settings):
+    # The x86 kernel uses relative pointers and aligns the entry to 4 bytes.
+    size = 12 if settings.get("DEBUG_BUGVERBOSE") == "y" else 8
+    if "#define HAVE_ARCH_BUG_FORMAT\n" in (kernel / "arch/x86/include/asm/bug.h").read_text():
+        size += 4
+    return size
 
 
 def stage(kernel, obj, dest, name, target, kbuild, image, abi):
@@ -216,7 +242,7 @@ def stage(kernel, obj, dest, name, target, kbuild, image, abi):
         (modules / link).unlink(missing_ok=True)
     (modules / "kernel-suffix").write_text(f"-uflinux-{name}\n")
     (modules / "vmlinuz").symlink_to(f"/boot/vmlinuz-uflinux-{name}")
-    if name in {"x86", "x86_64"} and not list(modules.rglob("i915.ko*")):
+    if name == "x86_64" and not list(modules.rglob("i915.ko*")):
         raise SystemExit("Missing i915 module")
     if target["arch"] != "x86":
         dtbs = boot / f"dtbs-uflinux-{name}"
@@ -244,7 +270,7 @@ def stage(kernel, obj, dest, name, target, kbuild, image, abi):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("target")
+    parser.add_argument("target", choices=json.loads((ROOT / "targets.json").read_text()))
     parser.add_argument("resolved", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--profile-build", action="store_true")
@@ -304,9 +330,14 @@ def main():
         kbuild.append(f"CLANG_AUTOFDO_PROFILE={afdo}")
     else:
         afdo = None
+    x86 = target["apk"] == "x86_64"
+    if x86:
+        bug_entry_size = x86_bug_entry_size(kernel, settings)
     if (bolt and not args.profile_build and target["apk"] in {"x86_64", "aarch64"}
-            and bolt_data.get("build_id") and shutil.which("llvm-bolt") and bolt_hook(kernel)):
+            and bolt_data.get("build_id") and shutil.which("llvm-bolt") and bolt_hook(kernel, x86)):
         os.environ.update(UFLINUX_BOLT_PROFILE=str(bolt), UFLINUX_BOLT_BUILD_ID=bolt_data["build_id"])
+        if x86:
+            os.environ["UFLINUX_BOLT_X86_BUG_SIZE"] = str(bug_entry_size)
     compression = {
         "zram": ("ZRAM", "ZRAM_DEF_COMP", "CRYPTO_LZ4", "CRYPTO_ZSTD"),
         "zswap": ("ZSWAP", "ZSWAP_COMPRESSOR_DEFAULT", "CRYPTO_LZ4", "CRYPTO_ZSTD"),
@@ -337,7 +368,7 @@ def main():
         flags = []
         omissions["O3"] = "Build succeeded only with Kbuild's optimization level"
     machine = {
-        "x86": r"Intel 80386", "x86_64": r"Advanced Micro Devices X86-64",
+        "x86_64": r"Advanced Micro Devices X86-64",
         "aarch64": r"AArch64", "riscv64": r"RISC-V",
     }[target["apk"]]
     header = run("readelf", "-h", str(obj / "vmlinux"), capture=True)
@@ -366,6 +397,8 @@ def main():
                 "optimization": "-O3" if flags else "Kbuild default",
                 "config_sha256": hashlib.sha256((obj / ".config").read_bytes()).hexdigest(),
                 "compiler": run("gcc" if gcc else "clang", "--version", capture=True).splitlines()[0]}
+    if args.profile_build and x86:
+        metadata["bolt_bug_entry_size"] = bug_entry_size
     (output / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
     run("tar", "--exclude=.git", "-I", "zstd -T2", "-cf", str(output / f"source-{name}.tar.zst"),
         "-C", str(output), "kernel", "kernel.config", "build.json")

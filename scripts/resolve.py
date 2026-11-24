@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ALPINE = "https://dl-cdn.alpinelinux.org/alpine"
 API = "https://api.github.com"
 RAW = "https://raw.githubusercontent.com"
-PLATFORMS = {"x86": "386", "x86_64": "amd64", "aarch64": "arm64", "riscv64": "riscv64"}
+PLATFORMS = {"x86_64": "amd64", "aarch64": "arm64", "riscv64": "riscv64"}
 
 
 def fetch(url, *, missing=False):

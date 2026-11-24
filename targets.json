@@ -1,6 +1,5 @@
 {
   "x86_64":       {"source":"stable", "arch":"x86",   "apk":"x86_64",  "runner":"ubuntu-26.04",    "config":"lts.x86_64.config",   "image":"arch/x86/boot/bzImage"},
-  "x86":          {"source":"stable", "arch":"x86",   "apk":"x86",     "runner":"ubuntu-26.04",    "config":"lts.x86.config",      "image":"arch/x86/boot/bzImage"},
   "aarch64":      {"source":"stable", "arch":"arm64", "apk":"aarch64", "runner":"ubuntu-26.04-arm","config":"lts.aarch64.config",  "image":"arch/arm64/boot/Image.gz"},
   "virt-x86_64":  {"source":"stable", "arch":"x86",   "apk":"x86_64",  "runner":"ubuntu-26.04",    "config":"virt.x86_64.config",  "image":"arch/x86/boot/bzImage"},
   "virt-aarch64": {"source":"stable", "arch":"arm64", "apk":"aarch64", "runner":"ubuntu-26.04-arm","config":"virt.aarch64.config", "image":"arch/arm64/boot/Image.gz"},

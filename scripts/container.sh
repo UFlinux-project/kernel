@@ -40,6 +40,10 @@ output=$(realpath -m "${3:-work/$target}")
 profile=${4:-}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 revision=${UFLINUX_PKGREL:-0}
+jq -e --arg name "$target" '.[$name]' "$repo/targets.json" >/dev/null || {
+    printf 'Unsupported kernel target: %s\n' "$target" >&2
+    exit 1
+}
 mkdir -p "$output"
 jq -e --arg name "$target" '.targets[$name]' "$resolved" >/dev/null
 builder=$(jq -r --arg name "$target" '.targets[$name].builder' "$resolved")

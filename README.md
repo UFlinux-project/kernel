@@ -1,16 +1,16 @@
 # UFlinux kernel builder
 
-GitHub Actions builds installable Alpine APKs for five generic or virtual-machine targets and three board targets. A nightly run resolves upstream sources and skips a release whose inputs have already been published. A manual run can build the whole matrix or export a profiling kernel for a single flavor.
+GitHub Actions builds installable Alpine APKs for four generic or virtual-machine targets and three board targets. A nightly run resolves upstream sources and skips a release whose inputs have already been published. A manual run can build the whole matrix or export a profiling kernel for a single flavor.
 
 | Target | Alpine architecture | Kernel source |
 |---|---|---|
-| `x86_64`, `x86`, `aarch64` | Matching Alpine architecture | Latest stable kernel.org release, with Alpine's stable generic configs |
+| `x86_64`, `aarch64` | Matching Alpine architecture | Latest stable kernel.org release, with Alpine's stable generic configs |
 | `virt-x86_64`, `virt-aarch64` | `x86_64`, `aarch64` | Same kernel.org source, with Alpine's stable VirtIO guest configs |
 | `orangepi-rv2` | `riscv64` | Orange Pi's current RV2 vendor recipe |
 | `dragon-q6a` | `aarch64` | The kernel referenced by Radxa's latest stable Q6A `linux-qcom` release |
 | `rpi` | `aarch64` | The kernel referenced by the latest stable Pi firmware release, with one 4 KiB `kernel8.img` for Pi 3, 4, and 5 |
 
-The x86 targets run on x86_64 workers. ARM targets use ARM64 workers. Orange Pi uses x86_64 Clang to cross-compile and QEMU user emulation for RISC-V APK packaging and install validation.
+The x86_64 targets run on x86_64 workers. ARM64 targets use ARM64 workers. Orange Pi uses x86_64 Clang to cross-compile and QEMU user emulation for RISC-V APK packaging and install validation.
 
 ## Build locally
 
@@ -34,13 +34,15 @@ AutoFDO and BOLT profiles are accepted for `x86_64`, `virt-x86_64`, `aarch64`, `
 
 For BOLT, profile the exact baseline kernel. Use `obj/vmlinux.unstripped` from a normal local build without a BOLT profile. If using AutoFDO too, make the AutoFDO profile available under `profiles/<target>/` before building that baseline. Add `profiles/<target>/kernel.fdata` and `bolt.json` with the kernel `source`, profile `sha256`, and baseline ELF `build_id` from `readelf -n vmlinux`. Keep the compiler, build configuration, and AutoFDO inputs identical to the baseline. See the [LLVM BOLT kernel instructions](https://github.com/llvm/llvm-project/blob/main/bolt/docs/OptimizingLinux.md) for the x86_64 collection workflow.
 
-On ARM64, BOLT requires a tool with AArch64 Linux kernel rewrite support. Upstream LLVM currently detects Linux kernels only on x86_64, and the build keeps the original linked image if BOLT fails to recognize the kernel or optimize it. For default-branch CI builds, `KERNEL_AARCH64_BUILD_RUNNER` can select an ARM64 runner with a compatible `llvm-bolt` on PATH. Locally, provide a container-compatible executable at `<output>/bolt/llvm-bolt`, or pass a native executable as `UFLINUX_BOLT_BINARY` to `scripts/prepare-bolt.sh <target> <output>`. Without a host tool, CI looks for an Ubuntu BOLT package when a BOLT profile is present. Profiles are optional, and profiling runs produce workflow artifacts without publishing a release.
+On x86_64, build the kernel rewriter with `scripts/build-kernel-bolt.sh <tools>` on Ubuntu 26.04 with the LLVM 22.1.2 development package. On ARM64, supply a rewriter with AArch64 Linux kernel support. Locally, provide a container-compatible executable at `<output>/bolt/llvm-bolt`, or pass a native executable as `UFLINUX_BOLT_BINARY` to `scripts/prepare-bolt.sh <target> <output>`. For CI builds using checked-in ARM64 profiles, `KERNEL_AARCH64_BUILD_RUNNER` can select a native runner with a compatible `llvm-bolt` on PATH. Profiles are optional for ordinary builds, and single-target profiling runs produce artifacts without publishing a release.
 
-To generate profiles during a full release, dispatch the workflow on the default branch with `profile_target=none` and `generate_release_profiles=true`. The **profile-release** job runs on a GitHub-hosted Ubuntu runner. It records kernel execution in QEMU's TCG emulator during mixed block I/O and loopback TCP, then converts the execution counts to AutoFDO and BOLT profiles. QEMU supplies the trace through software emulation.
+To generate profiles during a full release, dispatch the workflow on the default branch with `profile_target=none` and `generate_release_profiles=true`. The **profile-release** job records kernel execution in QEMU's TCG emulator during mixed block I/O and loopback TCP, then converts the execution counts to profiles.
 
 The workflow profiles `x86_64`, `virt-x86_64`, `aarch64`, and `virt-aarch64` independently and requires each release kernel to apply its own generated AutoFDO profile. `dragon-q6a` and `rpi` consume profiles supplied for their own board kernels.
 
-For supported x86_64 kernel layouts, the second pass profiles the kernel rebuilt with AutoFDO so the BOLT profile matches its exact ELF build ID. BOLT 22 expects the legacy `__ksymtab_gpl` section, which newer kernels have merged into `__ksymtab`. Its Linux kernel rewriter also lacks AArch64 support. The workflow logs these omissions and applies the generated AutoFDO profile.
+The second pass profiles the AutoFDO kernel so the BOLT profile matches its exact ELF build ID. On x86_64, the workflow builds a patched LLVM 22 rewriter for modern kernel metadata and preserves the original KASLR relocation sites. The build job uses the same rewriter that converted the trace, requires the rewrite to succeed, and boots the packaged image in QEMU before publication.
+
+GitHub-hosted ARM64 runners generate AutoFDO profiles. To enable the second pass for both ARM64 targets, set `KERNEL_AARCH64_BOLT_RUNNER` to an Ubuntu 26.04 ARM64 runner label with a compatible `llvm-bolt` on PATH. The supplied rewriter must support pre-aggregated traces and in-place kernel optimization. Upstream AArch64 kernel support remains in development. [LLVM AArch64 kernel BOLT proposal](https://github.com/llvm/llvm-project/pull/118022)
 
 ## Publish and install
 

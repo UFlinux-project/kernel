@@ -1,0 +1,197 @@
+diff --git a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp b/bolt/lib/Rewrite/LinuxKernelRewriter.cpp
+--- a/bolt/lib/Rewrite/LinuxKernelRewriter.cpp
++++ b/bolt/lib/Rewrite/LinuxKernelRewriter.cpp
+@@ -89,6 +89,11 @@
+              cl::desc("print ORC unwind information for instructions"),
+              cl::init(true), cl::Hidden, cl::cat(BoltCategory));
+ 
++cl::opt<unsigned> LinuxBugEntrySize(
++    "linux-bug-entry-size",
++    cl::desc("Size of the linked Linux kernel's struct bug_entry"),
++    cl::init(12), cl::cat(BoltCategory));
++
+ } // namespace opts
+ 
+ /// Linux kernel version
+@@ -270,7 +275,6 @@
+   ErrorOr<BinarySection &> BugTableSection = std::errc::bad_address;
+ 
+   /// Size of bug_entry struct.
+-  static constexpr size_t BUG_TABLE_ENTRY_SIZE = 12;
+ 
+   /// List of bug entries per function.
+   using FunctionBugListType =
+@@ -322,6 +326,7 @@
+   Error rewriteParaInstructions();
+ 
+   /// __bug_table section handling.
++  Error protectX86PatchSites();
+   Error readBugTable();
+   Error rewriteBugTable();
+ 
+@@ -353,6 +358,9 @@
+ 
+     processLKSections();
+ 
++    if (Error E = protectX86PatchSites())
++      return E;
++
+     if (Error E = processSMPLocks())
+       return E;
+ 
+@@ -478,8 +486,9 @@
+     SectionName = "__ksymtab_gpl";
+   ErrorOr<BinarySection &> SectionOrError =
+       BC.getUniqueSectionByName(SectionName);
+-  assert(SectionOrError &&
+-         "__ksymtab[_gpl] section not found in Linux Kernel binary");
++  // Current kernels put both classes of exports in __ksymtab.
++  if (!SectionOrError)
++    return;
+   const uint64_t SectionSize = SectionOrError->getSize();
+   const uint64_t SectionAddress = SectionOrError->getAddress();
+   assert((SectionSize % 4) == 0 &&
+@@ -500,6 +509,76 @@
+   }
+ }
+ 
++// Preserve instructions that the x86 kernel patches directly at runtime.
++Error LinuxKernelRewriter::protectX86PatchSites() {
++  for (BinarySection &Section : BC.allocatableSections()) {
++    StringRef Name = Section.getName();
++    const bool Track = Name == ".call_sites" || Name == ".return_sites";
++    if (!Track && Name != ".retpoline_sites" && Name != ".ibt_endbr_seal" &&
++        Name != ".cfi_sites" && Name != "__kcfi_traps" &&
++        !Name.starts_with("runtime_ptr_") &&
++        !Name.starts_with("runtime_shift_") &&
++        !Name.starts_with("runtime_mask_"))
++      continue;
++
++    if (Section.getSize() % 4)
++      return createStringError(errc::executable_format_error,
++                               "invalid patch-site table %s", Name.str().c_str());
++    AddressExtractor AE(Section.getContents(), Section.getAddress(),
++                        BC.AsmInfo->isLittleEndian(),
++                        BC.AsmInfo->getCodePointerSize());
++    AddressExtractor::Cursor Cursor(0);
++    while (Cursor.tell() < Section.getSize()) {
++      const uint64_t Offset = Cursor.tell();
++      const uint64_t IP = AE.getPCRelAddress32(Cursor);
++      if (!Cursor)
++        return Cursor.takeError();
++      BinaryFunction *BF = BC.getBinaryFunctionContainingAddress(IP);
++      if (!BF || !BC.shouldEmit(*BF))
++        continue;
++      MCInst *Inst = BF->getInstructionAtOffset(IP - BF->getAddress());
++      if (!Track || !Inst) {
++        BF->setIgnored();
++        continue;
++      }
++      MCSymbol *Label =
++          BC.MIB->getOrCreateInstLabel(*Inst, "__LKPatch_", BC.Ctx.get());
++      Fixups.push_back({Section, Offset, *BF, *Label, /*IsPCRelative*/ true});
++    }
++  }
++
++  // ftrace's table is embedded in .init.data. Its pointers may designate an
++  // instruction after ENDBR rather than the function's entry point.
++  const BinaryData *Start = BC.getBinaryDataByName("__start_mcount_loc");
++  const BinaryData *End = BC.getBinaryDataByName("__stop_mcount_loc");
++  if (!Start || !End || Start->getAddress() == End->getAddress())
++    return Error::success();
++  auto Section = BC.getSectionForAddress(Start->getAddress());
++  if (!Section || !Section->containsAddress(End->getAddress() - 1))
++    return createStringError(errc::executable_format_error,
++                             "invalid ftrace table");
++  const uint64_t PointerSize = BC.AsmInfo->getCodePointerSize();
++  for (uint64_t Address = Start->getAddress(); Address < End->getAddress();
++       Address += PointerSize) {
++    auto IP = BC.getUnsignedValueAtAddress(Address, PointerSize);
++    if (!IP)
++      return errorCodeToError(IP.getError());
++    BinaryFunction *BF = BC.getBinaryFunctionContainingAddress(*IP);
++    if (!BF || !BC.shouldEmit(*BF))
++      continue;
++    MCInst *Inst = BF->getInstructionAtOffset(*IP - BF->getAddress());
++    if (!Inst) {
++      BF->setIgnored();
++      continue;
++    }
++    MCSymbol *Label =
++        BC.MIB->getOrCreateInstLabel(*Inst, "__LKFentry_", BC.Ctx.get());
++    Fixups.push_back({*Section, Address - Section->getAddress(), *BF, *Label,
++                      /*IsPCRelative*/ false});
++  }
++  return Error::success();
++}
++
+ /// .smp_locks section contains PC-relative references to instructions with LOCK
+ /// prefix. The prefix can be converted to NOP at boot time on non-SMP systems.
+ Error LinuxKernelRewriter::processSMPLocks() {
+@@ -1312,7 +1391,9 @@
+   if (!BugTableSection)
+     return Error::success();
+ 
+-  if (BugTableSection->getSize() % BUG_TABLE_ENTRY_SIZE)
++  if ((opts::LinuxBugEntrySize != 8 && opts::LinuxBugEntrySize != 12 &&
++       opts::LinuxBugEntrySize != 16) ||
++      BugTableSection->getSize() % opts::LinuxBugEntrySize)
+     return createStringError(errc::executable_format_error,
+                              "bug table size error");
+ 
+@@ -1324,7 +1405,7 @@
+   while (Cursor && Cursor.tell() < BugTableSection->getSize()) {
+     const uint64_t Pos = Cursor.tell();
+     const uint64_t InstAddress = AE.getPCRelAddress32(Cursor);
+-    Cursor.seek(Pos + BUG_TABLE_ENTRY_SIZE);
++    Cursor.seek(Pos + opts::LinuxBugEntrySize);
+ 
+     if (!Cursor)
+       return createStringError(errc::executable_format_error,
+@@ -1384,7 +1465,7 @@
+         // Create a relocation entry for this bug entry.
+         MCSymbol *Label =
+             BC.MIB->getOrCreateInstLabel(Inst, "__BUG_", BC.Ctx.get());
+-        const uint64_t EntryOffset = (ID - 1) * BUG_TABLE_ENTRY_SIZE;
++        const uint64_t EntryOffset = (ID - 1) * opts::LinuxBugEntrySize;
+         BugTableSection->addRelocation(EntryOffset, Label, ELF::R_X86_64_PC32,
+                                        /*Addend*/ 0);
+       }
+@@ -1394,7 +1475,7 @@
+     // result of DCE, but setting their instruction address to zero.
+     for (const uint32_t ID : FunctionBugList[&BF]) {
+       if (!EmittedIDs.count(ID)) {
+-        const uint64_t EntryOffset = (ID - 1) * BUG_TABLE_ENTRY_SIZE;
++        const uint64_t EntryOffset = (ID - 1) * opts::LinuxBugEntrySize;
+         BugTableSection->addRelocation(EntryOffset, nullptr, ELF::R_X86_64_PC32,
+                                        /*Addend*/ 0);
+       }
+diff --git a/bolt/lib/Rewrite/RewriteInstance.cpp b/bolt/lib/Rewrite/RewriteInstance.cpp
+--- a/bolt/lib/Rewrite/RewriteInstance.cpp
++++ b/bolt/lib/Rewrite/RewriteInstance.cpp
+@@ -1402,7 +1402,24 @@
+     }
+   }
+ 
+-  if (!BC->IsLinuxKernel) {
++  if (BC->IsLinuxKernel) {
++    // Kbuild extracts KASLR relocations from the original linked ELF.
++    // Leave their targets in place in the optimized image.
++    for (const SectionRef &Section : InputFile->sections()) {
++      section_iterator Target = cantFail(Section.getRelocatedSection());
++      if (Target == InputFile->section_end() || !Target->isText())
++        continue;
++      for (const RelocationRef &Rel : Section.relocations()) {
++        const uint64_t Type = Rel.getType();
++        if (Type != ELF::R_X86_64_64 && Type != ELF::R_X86_64_32 &&
++            Type != ELF::R_X86_64_32S)
++          continue;
++        if (BinaryFunction *BF =
++                BC->getBinaryFunctionContainingAddress(Rel.getOffset()))
++          BF->setIgnored();
++      }
++    }
++  } else {
+     // Read all relocations now that we have binary functions mapped.
+     processRelocations();
+   }

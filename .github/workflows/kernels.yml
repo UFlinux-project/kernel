@@ -17,7 +17,6 @@ on:
         options:
           - none
           - x86_64
-          - x86
           - aarch64
           - virt-x86_64
           - virt-aarch64
@@ -82,7 +81,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.profile_matrix) }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: >-
+      ${{ matrix.runner == 'ubuntu-26.04-arm'
+          && vars.KERNEL_AARCH64_BOLT_RUNNER
+          || matrix.runner }}
     timeout-minutes: 300
     env:
       TARGET: ${{ matrix.target }}
@@ -98,14 +100,33 @@ jobs:
       - name: Install profiling tools
         run: |
           sudo apt-get update
-          packages=(qemu-system-x86 bolt-22)
+          packages=(qemu-system-x86 cmake ninja-build llvm-22-dev clang-22 g++ libzstd-dev zlib1g-dev)
           if [[ "$TARGET" == *aarch64 ]]; then
             packages=(qemu-system-arm)
           fi
           sudo apt-get install -y --no-install-recommends "${packages[@]}" gcc pkg-config libglib2.0-dev llvm-22
       - name: Collect AutoFDO and BOLT profiles with QEMU TCG
+        env:
+          AARCH64_BOLT_RUNNER: ${{ vars.KERNEL_AARCH64_BOLT_RUNNER }}
         run: |
-          scripts/collect-release-profiles.sh work/resolved.json work/release-profiles llvm-profgen-22 perf2bolt-22 llvm-profdata-22 "$TARGET"
+          bolt=
+          case "$TARGET" in
+            *x86_64)
+              scripts/build-kernel-bolt.sh work/kernel-bolt
+              bolt="$PWD/work/kernel-bolt/llvm-bolt"
+              ;;
+            *aarch64)
+              if [[ -n "$AARCH64_BOLT_RUNNER" ]]; then
+                bolt=$(command -v llvm-bolt)
+              else
+                echo "Collecting AutoFDO for $TARGET. Set KERNEL_AARCH64_BOLT_RUNNER to enable BOLT."
+              fi
+              ;;
+          esac
+          if [[ -n "$bolt" ]]; then
+            UFLINUX_BOLT_BINARY="$bolt" scripts/prepare-bolt.sh "$TARGET" work/release-profiles --bundle
+          fi
+          scripts/collect-release-profiles.sh work/resolved.json work/release-profiles llvm-profgen-22 "$bolt" llvm-profdata-22 "$TARGET"
       - uses: actions/upload-artifact@v7
         with:
           name: release-profiles-${{ matrix.target }}
@@ -157,7 +178,7 @@ jobs:
               sudo apt-get update
               sudo apt-get install -y qemu-system-arm
               ;;
-            x86|x86_64|virt-x86_64)
+            x86_64|virt-x86_64)
               sudo apt-get update
               sudo apt-get install -y qemu-system-x86
               ;;
@@ -170,13 +191,26 @@ jobs:
       - name: Build and install-test APK
         env:
           GENERATED_PROFILES: ${{ matrix.profile && inputs.generate_release_profiles }}
+          AARCH64_BOLT_RUNNER: ${{ vars.KERNEL_AARCH64_BOLT_RUNNER }}
         run: |
           args=()
+          require_bolt=false
+          if [[ "$GENERATED_PROFILES" == true && ( "$TARGET" == *x86_64 || -n "$AARCH64_BOLT_RUNNER" ) ]]; then
+            require_bolt=true
+          fi
           if [[ "$PROFILE_TARGET" != none ]]; then
             args+=(--profile-build)
-          elif [[ "$GENERATED_PROFILES" == true && -s "work/$TARGET/profiles/kernel.fdata" ]]; then
-            UFLINUX_BOLT_PACKAGE=bolt-22 scripts/prepare-bolt.sh "$TARGET" "work/$TARGET" "work/$TARGET/profiles"
-            test -x "work/$TARGET/bolt/llvm-bolt"
+          elif [[ "$require_bolt" == true ]]; then
+            test -s "work/$TARGET/profiles/kernel.fdata"
+            mv "work/$TARGET/profiles/bolt" "work/$TARGET/bolt"
+            optimizer="work/$TARGET/bolt/llvm-bolt"
+            chmod +x "$optimizer"
+            if [[ -f "work/$TARGET/bolt/lib/loader" ]]; then
+              chmod +x "work/$TARGET/bolt/lib/loader"
+              optimizer="work/$TARGET/bolt/lib/optimizer"
+            fi
+            expected=$(jq -er '.rewriter_sha256' "work/$TARGET/profiles/bolt.json")
+            printf '%s  %s\n' "$expected" "$optimizer" | sha256sum -c
           else
             if ! scripts/prepare-bolt.sh "$TARGET" "work/$TARGET"; then
               rm -f "work/$TARGET/bolt/llvm-bolt"
@@ -189,9 +223,10 @@ jobs:
               echo "::error::The release kernel did not apply its generated AutoFDO profile"
               exit 1
             }
-            if [[ -s "work/$TARGET/profiles/kernel.fdata" ]] &&
+            if [[ "$require_bolt" == true ]] &&
                ! jq -e '.bolt' "work/$TARGET/build.json" >/dev/null; then
-              echo "::warning::The release kernel used AutoFDO and BOLT could not optimize the ELF"
+              echo "::error::The release kernel did not apply its generated BOLT profile"
+              exit 1
             fi
           fi
       - name: Boot generic and guest kernels
@@ -202,7 +237,7 @@ jobs:
           cp work/"$TARGET"/*.apk work/"$TARGET"/source-*.tar.zst dist/
           cp work/"$TARGET"/build.json "dist/build-$TARGET.json"
           case "$TARGET" in
-            x86|x86_64|aarch64|orangepi-rv2)
+            x86_64|aarch64|orangepi-rv2)
               arch=$(jq -r --arg target "$TARGET" '.[$target].apk' targets.json)
               cp work/"$TARGET"/apk-zstd "dist/apk-zstd-$arch"
               ;;
@@ -330,7 +365,7 @@ jobs:
             test -s "dist/build-$target.json"
             test -s "dist/source-$target.tar.zst"
           done
-          for arch in x86 x86_64 aarch64 riscv64; do
+          for arch in x86_64 aarch64 riscv64; do
             test -s "dist/apk-zstd-$arch"
           done
           test -s dist/source-apk-zstd.tar.gz
@@ -371,7 +406,7 @@ jobs:
             if [[ "$state" == false ]]; then exit 0; fi
           else
             gh release create "$tag" --draft --target "$GITHUB_SHA" --title "UFlinux kernels ${FINGERPRINT:0:12}" \
-              --notes "Signed Alpine kernel APKs for eight targets. See the build manifests and SHA256SUMS."
+              --notes "Signed Alpine kernel APKs. See the build manifests and SHA256SUMS."
           fi
           gh release upload "$tag" dist/* --clobber
           gh release edit "$tag" --draft=false

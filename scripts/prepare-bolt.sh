@@ -9,25 +9,23 @@ case "$architecture" in
     x86_64|aarch64) ;;
     *) exit 0 ;;
 esac
-test -s "${3:-profiles/$target}/kernel.fdata" || exit 0
+binary=${UFLINUX_BOLT_BINARY:-}
+if [[ ${3:-} == --bundle ]]; then
+    : "${binary:?Set UFLINUX_BOLT_BINARY when bundling a rewriter}"
+else
+    test -s "${3:-profiles/$target}/kernel.fdata" || exit 0
+fi
 if [[ $(uname -m) != "$architecture" ]]; then
     echo "Preparing LLVM BOLT for $target requires a native $architecture host" >&2
     exit 1
 fi
 
-binary=${UFLINUX_BOLT_BINARY:-}
-if [[ -z "$binary" && "$architecture" == aarch64 ]]; then
+if [[ -z "$binary" ]]; then
     binary=$(command -v llvm-bolt || true)
 fi
 if [[ -z "$binary" ]]; then
-    sudo apt-get update
-    package=${UFLINUX_BOLT_PACKAGE:-}
-    if [[ -z "$package" ]]; then
-        package=$(apt-cache search --names-only '^bolt-[0-9]+$' | cut -d' ' -f1 | sort -V | tail -1)
-    fi
-    test -n "$package" || exit 0
-    sudo apt-get install -y "$package"
-    binary=$(command -v "llvm-bolt-${package#bolt-}")
+    echo "Set UFLINUX_BOLT_BINARY to an llvm-bolt with $architecture Linux kernel rewrite support" >&2
+    exit 1
 fi
 
 # Bundle the optimizer with its host loader and libraries for use under Alpine.

@@ -43,7 +43,7 @@ chmod 644 /out/initramfs
 /out/apk-zstd verify /out/*.apk
 
 case "$name" in
-  x86|x86_64|aarch64|virt-*) ;;
+  x86_64|aarch64|virt-*) ;;
   *) exit 0;;
 esac
 if [ -n "$profile_guest" ]; then

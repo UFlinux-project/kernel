@@ -4,7 +4,7 @@ set -euo pipefail
 resolved=$(realpath "${1:?Specify resolved inputs}")
 profiles=$(realpath -m "${2:?Specify the profile output directory}")
 profgen=${3:?Specify llvm-profgen}
-perf2bolt=${4:?Specify perf2bolt}
+bolt=${4?Specify llvm-bolt or pass an empty string for AutoFDO only}
 profdata=${5:?Specify llvm-profdata}
 target=${6:-virt-x86_64}
 case "$target" in
@@ -110,29 +110,29 @@ for mode in autofdo bolt; do
         grep -Eq '^[^[:space:]].*:[1-9][0-9]*:[0-9]+$' "$workspace/kernel.afdo.txt"
         jq --arg sha256 "$(sha256sum "$profile" | cut -d' ' -f1)" \
             '{source, config_sha256, sha256: $sha256}' "$manifest" > "$profiles/autofdo.json"
-        if [[ "$machine" == virt ]]; then
-            echo "::warning::Packaged BOLT 22 lacks the AArch64 Linux kernel rewriter. Using the generated AutoFDO profile."
-            break
-        fi
-        # BOLT 22 dereferences the legacy GPL export section unconditionally.
-        if ! readelf -SW "$output/vmlinux" | grep -E '[[:space:]]__ksymtab_gpl[[:space:]]' >/dev/null; then
-            echo "::warning::BOLT 22 requires the legacy __ksymtab_gpl section. Using the generated AutoFDO profile."
+        if [[ -z "$bolt" ]]; then
             break
         fi
     else
         profile="$profiles/kernel.fdata"
         # The BOLT format also has a misprediction count for each branch.
         awk '$1 == "B" {print $0 " 0"; next} {print}' "$trace" > "$workspace/kernel.preaggregated"
-        if ! "$perf2bolt" --pa -p "$workspace/kernel.preaggregated" -o "$workspace/kernel.fdata" "$output/vmlinux" ||
-           [[ ! -s "$workspace/kernel.fdata" ]]; then
-            echo "::warning::BOLT could not convert the kernel trace. Using the generated AutoFDO profile."
-            break
+        bolt_options=()
+        if [[ "$machine" == q35 ]]; then
+            bolt_options+=("--linux-bug-entry-size=$(jq -er '.bolt_bug_entry_size' "$manifest")")
         fi
+        "$bolt" --aggregate-only --pa --relocs=0 "${bolt_options[@]}" \
+            -p "$workspace/kernel.preaggregated" -o "$workspace/kernel.fdata" "$output/vmlinux" \
+            2>&1 | tee "$workspace/bolt-conversion.log"
+        grep -Fxq 'BOLT-INFO: Linux kernel binary detected' "$workspace/bolt-conversion.log"
+        test -s "$workspace/kernel.fdata"
         mv "$workspace/kernel.fdata" "$profile"
         build_id=$(readelf -n "$output/vmlinux" | awk '/Build ID:/ {print $3; exit}')
         test -n "$build_id"
         jq --arg sha256 "$(sha256sum "$profile" | cut -d' ' -f1)" --arg build_id "$build_id" \
-            '{source, build_id: $build_id, sha256: $sha256}' "$manifest" > "$profiles/bolt.json"
+            --arg rewriter_sha256 "$(sha256sum "$(command -v "$bolt")" | cut -d' ' -f1)" \
+            '{source, build_id: $build_id, sha256: $sha256, rewriter_sha256: $rewriter_sha256}' \
+            "$manifest" > "$profiles/bolt.json"
     fi
     sudo rm -rf -- "$output"
 done
