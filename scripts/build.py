@@ -116,8 +116,11 @@ def configure(kernel, obj, target, name, kbuild, bbr, autofdo, gcc=False):
               "CRYPTO_BLAKE2B")
     if re.search(r"^config CRYPTO_MLDSA\b", (kernel / "crypto/Kconfig").read_text(), re.M):
         crypto += ("CRYPTO_MLDSA",)
+    # Lockdown can select MODULE_SIG. Clear the key too so Kbuild does not
+    # embed a random certificate and change the ELF build ID between builds.
     set_config("--set-str", "LOCALVERSION", f"-uflinux-{name}", "-d", "LOCALVERSION_AUTO",
-               "-e", "MODULES", "-d", "MODULE_SIG", "-d", "MODULE_SIG_ALL", "--set-str", "SYSTEM_TRUSTED_KEYS", "",
+               "-e", "MODULES", "-d", "MODULE_SIG", "-d", "MODULE_SIG_ALL", "--set-str", "MODULE_SIG_KEY", "",
+               "--set-str", "SYSTEM_TRUSTED_KEYS", "",
                "--set-str", "SYSTEM_REVOCATION_KEYS", "", "-d", "WERROR", "-d", "RUST",
                "-d", "GCC_PLUGINS", "-e", "DEBUG_INFO_NONE", "-d", "DEBUG_INFO_BTF", "-d", "DEBUG_INFO_BTF_MODULES",
                "-e", "TCP_CONG_ADVANCED", "-e", "TCP_CONG_CUBIC", "-e", symbol, "-e", selector,
