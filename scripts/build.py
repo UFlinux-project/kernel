@@ -90,7 +90,7 @@ def enable_arm64_autofdo(kernel):
     opt_in = "\tselect ARCH_SUPPORTS_AUTOFDO_CLANG\n"
     if opt_in not in text:
         marker = "\tselect ARCH_SUPPORTS_LTO_CLANG_THIN\n"
-        if text.count(marker) != 1:
+        if text.count(marker) != 1 or "mksysmap()" not in text:
             raise SystemExit("ARM64 AutoFDO Kconfig layout changed")
         kconfig.write_text(text.replace(marker, marker + opt_in))
 
@@ -207,6 +207,8 @@ if [ -n "${UFLINUX_BOLT_PROFILE:-}" ]; then
                 mv "$bolt_input" "$bolt_input.pre-bolt"
             fi
             mv "$bolt_input.bolt" "$bolt_input"
+            # The original map was generated before BOLT moved symbols.
+            mksysmap "$bolt_input" System.map
             touch .uflinux-bolt-applied
         else
             rm -f "$bolt_input.bolt"
@@ -236,6 +238,7 @@ def stage(kernel, obj, dest, name, target, kbuild, image, abi):
     boot.mkdir(parents=True)
     shutil.copy2(image, boot / f"vmlinuz-uflinux-{name}")
     shutil.copy2(obj / ".config", boot / f"config-uflinux-{name}")
+    shutil.copy2(obj / "System.map", boot / f"System.map-uflinux-{name}")
     run(*kbuild, f"INSTALL_MOD_PATH={dest}", "INSTALL_MOD_STRIP=1", "modules_install")
     modules = dest / "lib/modules" / abi
     for link in ("build", "source"):

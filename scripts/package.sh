@@ -33,6 +33,9 @@ rm /guest/test-kernel.apk /guest/tmp/apk-zstd
 for path in "boot/vmlinuz-uflinux-$name" "boot/initramfs-uflinux-$name"; do
     test -s "/guest/$path"
 done
+map="boot/System.map-uflinux-$name"
+test -s "/guest/$map"
+cmp "/out/stage/$map" "/guest/$map"
 abi=$(find /out/stage/lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
 test -s "/guest/lib/modules/$abi/modules.dep"
 module=$(find "/guest/lib/modules/$abi" -type f -name '*.ko*' -print -quit)
