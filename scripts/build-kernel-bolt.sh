@@ -18,7 +18,9 @@ trap 'rm -rf -- "$workspace"' EXIT
 curl -fsSL --retry 3 "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/$archive" \
     -o "$workspace/$archive"
 printf '%s  %s\n' "$sha256" "$workspace/$archive" | sha256sum -c
-tar -xJf "$workspace/$archive" -C "$workspace" --strip-components=1 --wildcards \
+# --no-wildcards-match-slash keeps '*/cmake' from swallowing '*/llvm/cmake':
+# GNU tar reports the later directory as "Not found in archive" and exits 2.
+tar -xJf "$workspace/$archive" -C "$workspace" --strip-components=1 --wildcards --no-wildcards-match-slash \
     '*/bolt' '*/cmake' '*/llvm/cmake' '*/llvm/include' '*/llvm/lib/Target/X86'
 git -C "$workspace" apply "$repo/patches/llvm-bolt/linux-kernel.patch"
 
