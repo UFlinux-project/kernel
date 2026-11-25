@@ -182,12 +182,19 @@ def profile(name, kind, target):
     return path, data
 
 
-def bolt_hook(kernel, x86):
+def bolt_hook(kernel, x86, *, reuse_link=False):
     script = kernel / "scripts/link-vmlinux.sh"
     text = script.read_text()
     marker = "# For fixdep"
     if text.count(marker) != 1 or "mksysmap()" not in text:
         return False
+    if reuse_link:
+        link_start = '${MAKE} -f "${srctree}/scripts/Makefile.build" obj=init init/version-timestamp.o'
+        if text.count(link_start) != 1:
+            return False
+        # The repack target reruns the image recipes against the profiled ELF.
+        text = text.replace(link_start, 'if [ -z "${UFLINUX_BOLT_REPACK:-}" ]; then\n' + link_start)
+        text = text.replace(marker, "fi\n\n" + marker)
     if x86:
         recipe = kernel / "arch/x86/boot/compressed/Makefile"
         recipe_text = recipe.read_text()
@@ -282,19 +289,76 @@ def stage(kernel, obj, dest, name, target, kbuild, image, abi):
             shutil.copy2(image, boot / "kernel8.img")
 
 
+def write_build_metadata(output, name, metadata):
+    (output / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    run("tar", "--exclude=.git", "-I", "zstd -T2", "-cf", str(output / f"source-{name}.tar.zst"),
+        "-C", str(output), "kernel", "kernel.config", "build.json")
+
+
+def apply_collected_bolt(output, name, target, kbuild):
+    kernel, obj = output / "kernel", output / "obj"
+    metadata = json.loads((output / "build.json").read_text())
+    afdo, afdo_data = profile(name, "autofdo", target)
+    bolt, bolt_data = profile(name, "bolt", target)
+    optimizer = shutil.which("llvm-bolt")
+    if (metadata["target"] != name or metadata["source"] != target["ref"] or not metadata["autofdo"]
+            or not afdo or afdo_data.get("config_sha256") != metadata["config_sha256"]
+            or not bolt or not bolt_data.get("build_id") or not optimizer):
+        raise SystemExit(f"{name}: missing AutoFDO build or matching BOLT inputs")
+    bundled_optimizer = Path(optimizer).parent / "lib/optimizer"
+    with (bundled_optimizer if bundled_optimizer.is_file() else Path(optimizer)).open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != bolt_data.get("rewriter_sha256"):
+            raise SystemExit(f"{name}: llvm-bolt differs from the rewriter used to convert the trace")
+    with (obj / "vmlinux.unstripped").open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != bolt_data.get("input_sha256"):
+            raise SystemExit(f"{name}: the linked ELF differs from the profiled ELF")
+
+    x86 = target["arch"] == "x86"
+    if not bolt_hook(kernel, x86, reuse_link=True):
+        raise SystemExit(f"{name}: Kbuild layout changed, cannot repack the profiled kernel")
+    os.environ.update(UFLINUX_BOLT_PROFILE=str(bolt), UFLINUX_BOLT_BUILD_ID=bolt_data["build_id"],
+                      UFLINUX_BOLT_REPACK="1")
+    if x86:
+        os.environ["UFLINUX_BOLT_X86_BUG_SIZE"] = str(metadata["bolt_bug_entry_size"])
+    flags = ["KCFLAGS=-O3"] if metadata["optimization"] == "-O3" else []
+    image = obj / target["image"]
+    jobs = f"-j{min(4, os.cpu_count() or 1)}"
+    run(*kbuild, f"CLANG_AUTOFDO_PROFILE={afdo}", *flags, jobs, image.name, "modules")
+    if not (obj / ".uflinux-bolt-applied").is_file():
+        raise SystemExit(f"{name}: BOLT did not rewrite the profiled kernel")
+
+    boot = output / "stage" / "boot"
+    shutil.copy2(image, boot / f"vmlinuz-uflinux-{name}")
+    shutil.copy2(obj / "System.map", boot / f"System.map-uflinux-{name}")
+    metadata["bolt"] = True
+    metadata["omissions"].pop("BOLT", None)
+    write_build_metadata(output, name, metadata)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("target", choices=json.loads((ROOT / "targets.json").read_text()))
     parser.add_argument("resolved", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--profile-build", action="store_true")
-    parser.add_argument("--prepare-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--profile-build", action="store_true")
+    mode.add_argument("--prepare-only", action="store_true")
+    mode.add_argument("--apply-collected-bolt", action="store_true")
     args = parser.parse_args()
     name = args.target
     target = json.loads(args.resolved.read_text())["targets"][name]
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     kernel, obj = output / "kernel", output / "obj"
+    os.environ.update(KBUILD_BUILD_USER="uflinux", KBUILD_BUILD_HOST="kernel",
+                      KBUILD_BUILD_TIMESTAMP="Thu Jan  1 00:00:00 UTC 1970", KBUILD_BUILD_VERSION="1",
+                      SOURCE_DATE_EPOCH="0", KCONFIG_NOTIMESTAMP="1", LC_ALL="C")
+    gcc = target.get("compiler") == "gcc"
+    toolchain = ["CC=gcc", "HOSTCC=gcc", "HOSTCXX=g++"] if gcc else ["LLVM=1", "LLVM_IAS=1"]
+    kbuild = ["make", "-C", str(kernel), f"O={obj}", f"ARCH={target['arch']}", "LOCALVERSION=", *toolchain]
+    if args.apply_collected_bolt:
+        apply_collected_bolt(output, name, target, kbuild)
+        return
     kernel.mkdir()
     obj.mkdir()
     archive = output / "upstream.tar"
@@ -325,12 +389,6 @@ def main():
         print(json.dumps(records, indent=2))
         return
 
-    os.environ.update(KBUILD_BUILD_USER="uflinux", KBUILD_BUILD_HOST="kernel",
-                      KBUILD_BUILD_TIMESTAMP="Thu Jan  1 00:00:00 UTC 1970", KBUILD_BUILD_VERSION="1",
-                      SOURCE_DATE_EPOCH="0", KCONFIG_NOTIMESTAMP="1", LC_ALL="C")
-    gcc = target.get("compiler") == "gcc"
-    toolchain = ["CC=gcc", "HOSTCC=gcc", "HOSTCXX=g++"] if gcc else ["LLVM=1", "LLVM_IAS=1"]
-    kbuild = ["make", "-C", str(kernel), f"O={obj}", f"ARCH={target['arch']}", "LOCALVERSION=", *toolchain]
     afdo, afdo_data = profile(name, "autofdo", target)
     bolt, bolt_data = profile(name, "bolt", target)
     if target["arch"] == "arm64" and (afdo or args.profile_build):
@@ -413,9 +471,7 @@ def main():
                 "compiler": run("gcc" if gcc else "clang", "--version", capture=True).splitlines()[0]}
     if args.profile_build and x86:
         metadata["bolt_bug_entry_size"] = bug_entry_size
-    (output / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    run("tar", "--exclude=.git", "-I", "zstd -T2", "-cf", str(output / f"source-{name}.tar.zst"),
-        "-C", str(output), "kernel", "kernel.config", "build.json")
+    write_build_metadata(output, name, metadata)
 
 
 if __name__ == "__main__":

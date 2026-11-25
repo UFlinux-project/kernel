@@ -95,12 +95,14 @@ else
 fi
 
 # Prepare packaging tools before starting the long kernel compilation.
-# shellcheck disable=SC2016
-"$runtime" run --rm "${container_options[@]}" --platform "$package_platform" \
-    -v "$repo:/builder:ro" -v "$output:/out" "$package_image" sh -ec '
-    cp /out/repositories /etc/apk/repositories
-    sh /builder/scripts/build-apk-zstd.sh "$1" "$2" /out
-    ' sh "$aports_ref" "$series"
+if [[ "$profile" != --apply-collected-bolt ]]; then
+    # shellcheck disable=SC2016
+    "$runtime" run --rm "${container_options[@]}" --platform "$package_platform" \
+        -v "$repo:/builder:ro" -v "$output:/out" "$package_image" sh -ec '
+        cp /out/repositories /etc/apk/repositories
+        sh /builder/scripts/build-apk-zstd.sh "$1" "$2" /out
+        ' sh "$aports_ref" "$series"
+fi
 
 # The literal script expands its arguments inside the Alpine build container.
 # shellcheck disable=SC2016

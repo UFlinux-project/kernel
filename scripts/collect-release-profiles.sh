@@ -7,6 +7,7 @@ profgen=${3:?Specify llvm-profgen}
 bolt=${4?Specify llvm-bolt or pass an empty string for AutoFDO only}
 profdata=${5:?Specify llvm-profdata}
 target=${6:-virt-x86_64}
+release_output=${7:-}
 case "$target" in
     x86_64|virt-x86_64)
         emulator=qemu-system-x86_64
@@ -130,9 +131,21 @@ for mode in autofdo bolt; do
         build_id=$(readelf -n "$output/vmlinux" | awk '/Build ID:/ {print $3; exit}')
         test -n "$build_id"
         jq --arg sha256 "$(sha256sum "$profile" | cut -d' ' -f1)" --arg build_id "$build_id" \
+            --arg input_sha256 "$(sha256sum "$output/vmlinux" | cut -d' ' -f1)" \
             --arg rewriter_sha256 "$(sha256sum "$(command -v "$bolt")" | cut -d' ' -f1)" \
-            '{source, build_id: $build_id, sha256: $sha256, rewriter_sha256: $rewriter_sha256}' \
+            '{source, build_id: $build_id, input_sha256: $input_sha256, sha256: $sha256, rewriter_sha256: $rewriter_sha256}' \
             "$manifest" > "$profiles/bolt.json"
+        if [[ -n "$release_output" ]]; then
+            cp "$profile" "$profiles/bolt.json" "$output/profiles/"
+            cp -a "$profiles/bolt" "$output/bolt"
+            UFLINUX_PROFILE_GUEST='' scripts/container.sh "$target" "$resolved" "$output" --apply-collected-bolt
+            jq -e '.autofdo and .bolt' "$manifest" >/dev/null
+            scripts/boot-test.sh "$target" "$output"
+            mkdir -p "$release_output"
+            cp "$output/"*.apk "$output/"*.ec.pem.pub "$output/apk-zstd" \
+                "$output/source-apk-zstd.tar.gz" "$output/source-$target.tar.zst" \
+                "$manifest" "$output/kernel.config" "$output/boot-test.log" "$release_output/"
+        fi
     fi
     sudo rm -rf -- "$output"
 done

@@ -119,7 +119,7 @@ jobs:
       ${{ matrix.runner == 'ubuntu-26.04-arm'
           && vars.KERNEL_AARCH64_BOLT_RUNNER
           || matrix.runner }}
-    timeout-minutes: 300
+    timeout-minutes: 360
     env:
       TARGET: ${{ matrix.target }}
       UFLINUX_PKGREL: ${{ github.run_number }}
@@ -179,12 +179,21 @@ jobs:
           if [[ -n "$bolt" ]]; then
             UFLINUX_BOLT_BINARY="$bolt" scripts/prepare-bolt.sh "$TARGET" work/release-profiles --bundle
           fi
-          scripts/collect-release-profiles.sh work/resolved.json work/release-profiles "llvm-profgen-$major" "$bolt" "llvm-profdata-$major" "$TARGET"
+          scripts/collect-release-profiles.sh work/resolved.json work/release-profiles \
+            "llvm-profgen-$major" "$bolt" "llvm-profdata-$major" "$TARGET" work/profiled-kernel
       - uses: actions/upload-artifact@v7
         with:
           name: release-profiles-${{ matrix.target }}
           path: work/release-profiles
           if-no-files-found: error
+          overwrite: true
+      - uses: actions/upload-artifact@v7
+        if: matrix.builder == 'x86_64' || vars.KERNEL_AARCH64_BOLT_RUNNER != ''
+        with:
+          name: profiled-kernel-${{ matrix.target }}
+          path: work/profiled-kernel
+          if-no-files-found: error
+          compression-level: 0
           overwrite: true
 
   build:
@@ -204,6 +213,7 @@ jobs:
       TARGET: ${{ matrix.target }}
       PROFILE_TARGET: ${{ inputs.profile_target || 'none' }}
       UFLINUX_PKGREL: ${{ github.run_number }}
+      BOLT_RELEASE: ${{ matrix.profile && inputs.generate_release_profiles && (matrix.builder == 'x86_64' || vars.KERNEL_AARCH64_BOLT_RUNNER != '') }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -212,7 +222,13 @@ jobs:
         with:
           name: resolved-inputs
           path: work
+      - uses: actions/download-artifact@v8
+        if: env.BOLT_RELEASE == 'true'
+        with:
+          name: profiled-kernel-${{ matrix.target }}
+          path: work/${{ matrix.target }}
       - name: Install emulators
+        if: env.BOLT_RELEASE != 'true'
         run: |
           case "$TARGET" in
             orangepi-rv2)
@@ -237,42 +253,26 @@ jobs:
               ;;
           esac
       - uses: actions/download-artifact@v8
-        if: matrix.profile && inputs.generate_release_profiles
+        if: env.BOLT_RELEASE != 'true' && matrix.profile && inputs.generate_release_profiles
         with:
           name: release-profiles-${{ matrix.target }}
           path: work/${{ matrix.target }}/profiles
       - uses: actions/download-artifact@v8
-        if: inputs.generate_release_profiles
+        if: env.BOLT_RELEASE != 'true' && inputs.generate_release_profiles
         with:
           name: alpine-build-deps-${{ matrix.builder }}
           path: work/kernel-packages
       - name: Build and install-test APK
+        if: env.BOLT_RELEASE != 'true'
         env:
-          GENERATED_PROFILES: ${{ matrix.profile && inputs.generate_release_profiles }}
           RELEASE_PROFILES: ${{ inputs.generate_release_profiles }}
-          AARCH64_BOLT_RUNNER: ${{ vars.KERNEL_AARCH64_BOLT_RUNNER }}
         run: |
           args=()
-          require_bolt=false
           if [[ "$RELEASE_PROFILES" == true ]]; then
             export UFLINUX_KERNEL_PACKAGES=work/kernel-packages
           fi
-          if [[ "$GENERATED_PROFILES" == true && ( "$TARGET" == *x86_64 || -n "$AARCH64_BOLT_RUNNER" ) ]]; then
-            require_bolt=true
-          fi
           if [[ "$PROFILE_TARGET" != none ]]; then
             args+=(--profile-build)
-          elif [[ "$require_bolt" == true ]]; then
-            test -s "work/$TARGET/profiles/kernel.fdata"
-            mv "work/$TARGET/profiles/bolt" "work/$TARGET/bolt"
-            optimizer="work/$TARGET/bolt/llvm-bolt"
-            chmod +x "$optimizer"
-            if [[ -f "work/$TARGET/bolt/lib/loader" ]]; then
-              chmod +x "work/$TARGET/bolt/lib/loader"
-              optimizer="work/$TARGET/bolt/lib/optimizer"
-            fi
-            expected=$(jq -er '.rewriter_sha256' "work/$TARGET/profiles/bolt.json")
-            printf '%s  %s\n' "$expected" "$optimizer" | sha256sum -c
           else
             if ! scripts/prepare-bolt.sh "$TARGET" "work/$TARGET"; then
               rm -f "work/$TARGET/bolt/llvm-bolt"
@@ -280,18 +280,19 @@ jobs:
             fi
           fi
           scripts/container.sh "$TARGET" work/resolved.json "work/$TARGET" "${args[@]}"
-          if [[ "$GENERATED_PROFILES" == true ]]; then
-            jq -e '.autofdo' "work/$TARGET/build.json" >/dev/null || {
-              echo "::error::The release kernel did not apply its generated AutoFDO profile"
-              exit 1
-            }
-            if [[ "$require_bolt" == true ]] &&
-               ! jq -e '.bolt' "work/$TARGET/build.json" >/dev/null; then
-              echo "::error::The release kernel did not apply its generated BOLT profile"
-              exit 1
-            fi
+      - name: Verify generated profiles were applied
+        if: matrix.profile && inputs.generate_release_profiles
+        run: |
+          if ! jq -e '.autofdo' "work/$TARGET/build.json" >/dev/null; then
+            echo "::error::The release kernel did not apply its generated AutoFDO profile"
+            exit 1
+          fi
+          if [[ "$BOLT_RELEASE" == true ]] && ! jq -e '.bolt' "work/$TARGET/build.json" >/dev/null; then
+            echo "::error::The release kernel did not apply its generated BOLT profile"
+            exit 1
           fi
       - name: Boot generic and guest kernels
+        if: env.BOLT_RELEASE != 'true'
         run: scripts/boot-test.sh "$TARGET" "work/$TARGET"
       - name: Collect release files
         run: |
