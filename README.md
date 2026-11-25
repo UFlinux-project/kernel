@@ -30,19 +30,29 @@ The generic kernels keep Alpine's CPU baselines. Optimizations use Clang, ThinLT
 
 ### UFlinux profiles
 
-AutoFDO and BOLT profiles are accepted for `x86_64`, `virt-x86_64`, `aarch64`, `virt-aarch64`, `dragon-q6a`, and `rpi` when the kernel and tools support them. For an AutoFDO collection kernel, choose a target in the workflow's `profile_target` input or add `--profile-build` as the fourth argument to `scripts/container.sh`. The profiling build exports `vmlinux` and a manifest. Use a representative workload and the kernel’s [AutoFDO instructions](https://docs.kernel.org/dev-tools/autofdo.html) to create `profiles/<target>/kernel.afdo`. Add `autofdo.json` with `source`, `sha256`, and `config_sha256` from the collection build and the profile file. On ARM64, collect samples on hardware that can expose a supported trace source such as SPE or CoreSight ETM.
+Scheduled releases use the ordinary build path. To generate profiles for a full release, dispatch the workflow on the default branch with `profile_target=none` and `generate_release_profiles=true`. The workflow independently profiles `x86_64`, `virt-x86_64`, `aarch64`, and `virt-aarch64` using mixed block I/O and loopback TCP in QEMU. Clang instrumentation covers selected built-in block, memory, filesystem, and networking code. The optimized kernel consumes the resulting instrumentation profile without including the counter exporter.
 
-For BOLT, profile the exact baseline kernel. Use `obj/vmlinux.unstripped` from a normal local build without a BOLT profile. If using AutoFDO too, make the AutoFDO profile available under `profiles/<target>/` before building that baseline. Add `profiles/<target>/kernel.fdata` and `bolt.json` with the kernel `source`, profile `sha256`, and baseline ELF `build_id` from `readelf -n vmlinux`. Keep the compiler, build configuration, and AutoFDO inputs identical to the baseline. See the [LLVM BOLT kernel instructions](https://github.com/llvm/llvm-project/blob/main/bolt/docs/OptimizingLinux.md) for the x86_64 collection workflow.
+To collect a profile locally for a generic or virtual target, use matching Alpine build dependencies in both builds:
 
-On x86_64, run `python3 scripts/resolve.py --generate-profiles` to record the newest stable LLVM source release that matches the Ubuntu 26.04 packages in the LLVM APT repository. Install the x86_64 package versions listed in `llvm.apt_packages` in `work/resolved.json`, then run `scripts/build-kernel-bolt.sh <tools> work/resolved.json`. On ARM64, supply a rewriter with AArch64 Linux kernel support. Locally, provide a container-compatible executable at `<output>/bolt/llvm-bolt`, or pass a native executable as `UFLINUX_BOLT_BINARY` to `scripts/prepare-bolt.sh <target> <output>`. For CI builds using checked-in ARM64 profiles, `KERNEL_AARCH64_BUILD_RUNNER` can select a native runner with a compatible `llvm-bolt` on PATH. Profiles are optional for ordinary builds, and single-target profiling runs produce artifacts without publishing a release.
+```sh
+target=virt-x86_64
+output=work/collection
+python3 scripts/resolve.py --target "$target"
+UFLINUX_PROFILE_GUEST=1 scripts/container.sh "$target" work/resolved.json "$output" --profile-build
+scripts/collect-release-profiles.sh work/resolved.json "$output/profiles" "$target" pgo "$output"
+UFLINUX_KERNEL_PHASE=merge-pgo scripts/container.sh "$target" work/resolved.json "$output"
+mkdir -p "work/$target/profiles"
+cp "$output/profiles/"* "work/$target/profiles/"
+scripts/container.sh "$target" work/resolved.json "work/$target"
+```
 
-To generate profiles during a full release, dispatch the workflow on the default branch with `profile_target=none` and `generate_release_profiles=true`. The **profile-release** job records kernel execution in QEMU's TCG emulator during mixed block I/O and loopback TCP, then converts the execution counts to profiles.
+The profile pair is `kernel.profdata` and `pgo.json`. Use the pair together. Its metadata binds it to the target, source, patches, configuration, compiler and optimization flags. Single-target workflow dispatches using `profile_target` produce an instrumented APK and `vmlinux` as workflow artifacts without publishing a release.
 
-The workflow profiles `x86_64`, `virt-x86_64`, `aarch64`, and `virt-aarch64` independently and requires each release kernel to apply its own generated AutoFDO profile. `dragon-q6a` and `rpi` consume profiles supplied for their own board kernels.
+For BOLT, use the exact linked ELF from the PGO-optimized build. CI separates the collection compile, PGO training, release compile, BOLT rewrite, and APK packaging and boot tests. The x86 jobs share a single patched rewriter. The rewrite job verifies the input ELF and rewriter, preserves x86 KASLR relocations, and regenerates the boot image before packaging. The release manifests report PGO and BOLT separately.
 
-The second pass profiles the AutoFDO kernel and rewrites that exact ELF on the profiling runner, using the same rewriter that converted the trace. The workflow verifies the ELF checksum and build ID, then regenerates the boot image and tests the packaged kernel in QEMU before handing the APK to the release build job. On x86_64, the patched rewriter preserves the original KASLR relocation sites. Profiling and release compilation install the same snapshot of Alpine build packages for each architecture.
+To build the x86 rewriter locally, resolve with `--generate-profiles`, install the x86_64 LLVM versions listed in `work/resolved.json`, and run `scripts/build-kernel-bolt.sh <tools> work/resolved.json`. Bundle that binary using `UFLINUX_BOLT_BINARY` with `scripts/prepare-bolt.sh <target> <output> --bundle`. For a local training run, place the PGO profile pair in a fresh output directory under `profiles/`, then run `container.sh` with `--bolt-baseline` and `UFLINUX_PROFILE_GUEST=1`. Run `collect-release-profiles.sh <resolved> <output>/profiles <target> bolt <output> <output>/bolt/llvm-bolt`, then run `container.sh` with `--apply-collected-bolt` against that same output. Boot-test the rewritten package with `scripts/boot-test.sh`.
 
-GitHub-hosted ARM64 runners generate AutoFDO profiles. To enable the second pass for both ARM64 targets, set `KERNEL_AARCH64_BOLT_RUNNER` to an Ubuntu 26.04 ARM64 runner label with a compatible `llvm-bolt` on PATH. The supplied rewriter must support pre-aggregated traces and in-place kernel optimization. Upstream AArch64 kernel support remains in development. [LLVM AArch64 kernel BOLT proposal](https://github.com/llvm/llvm-project/pull/118022)
+In the opt-in profiling workflow, ARM64 uses PGO. Set `KERNEL_AARCH64_BOLT_RUNNER` to an Ubuntu 26.04 ARM64 runner with a compatible `llvm-bolt` on PATH to add BOLT. Its rewriter must support pre-aggregated traces and in-place kernel optimization. [LLVM AArch64 kernel BOLT proposal](https://github.com/llvm/llvm-project/pull/118022)
 
 ## Publish and install
 

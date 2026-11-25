@@ -28,8 +28,17 @@ trap 'profile_failed "$?"' EXIT
 grep -qs ' /proc proc ' /proc/mounts || mount -t proc proc /proc
 grep -qs ' /sys sysfs ' /proc/mounts || mount -t sysfs sysfs /sys
 mount -o remount,rw /
+pgo=false
+if grep -qw uflinux.pgo=1 /proc/cmdline; then
+    pgo=true
+    test -r /proc/uflinux-pgo-counters
+    cat /proc/uflinux-pgo-counters > /dev/vdb
+fi
 echo UFLINUX_PROFILE_START
 "$0" workload
+if "$pgo"; then
+    cat /proc/uflinux-pgo-counters > /dev/vdc
+fi
 sync
 echo UFLINUX_PROFILE_OK
 trap - EXIT

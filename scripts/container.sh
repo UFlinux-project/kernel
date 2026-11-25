@@ -37,7 +37,7 @@ kernel_packages() {
         | ($toolchain.major | tostring) as $major
         | ["alpine-sdk", "bash", "bc", "bison", "flex", "perl", "python3", "curl", "openssl-dev",
            "elfutils-dev", "linux-headers", "ncurses-dev", "zlib-dev", "zstd", "gzip", "xz",
-           "diffutils", "findutils", "kmod", "cpio", "gmp-dev", "mpc1-dev", "mpfr-dev", "rsync"][],
+           "diffutils", "findutils", "tar", "kmod", "cpio", "gmp-dev", "mpc1-dev", "mpfr-dev", "rsync"][],
           (["clang" + $major, "lld" + $major, "llvm" + $major, "gcc", "binutils", "abuild"][] as $name
            | ($toolchain.versions[$name] // error("Missing resolved Alpine package version for " + $name)) as $version
            | "\($name)=\($version)")
@@ -64,6 +64,11 @@ target=${1:?Specify a target}
 resolved=$(realpath "${2:-work/resolved.json}")
 output=$(realpath -m "${3:-work/$target}")
 profile=${4:-}
+phase=${UFLINUX_KERNEL_PHASE:-all}
+case "$phase" in
+    all|compile|package|merge-pgo) ;;
+    *) printf 'Unsupported kernel phase: %s\n' "$phase" >&2; exit 1 ;;
+esac
 repo=$(cd "$(dirname "$0")/.." && pwd)
 revision=${UFLINUX_PKGREL:-0}
 jq -e --arg name "$target" '.[$name]' "$repo/targets.json" >/dev/null || {
@@ -76,26 +81,62 @@ builder=$(jq -r --arg name "$target" '.targets[$name].builder' "$resolved")
 architecture=$(jq -r --arg name "$target" '.targets[$name].apk' "$resolved")
 version=$(jq -r --arg name "$target" '.targets[$name].version' "$resolved")
 major=$(jq -er --arg arch "$builder" '.toolchains[$arch].major' "$resolved")
-build_image=$(alpine_image "$resolved" "$builder")
-package_image=$(alpine_image "$resolved" "$architecture")
-package_platform=$(jq -er --arg a "$architecture" '.alpine[$a].platform | "linux/"+.' "$resolved")
 # Map the rolling mirror to the stable Alpine series chosen by the resolver.
 aports_ref=$(jq -er .aports "$resolved")
 series=$(jq -r '.alpine.x86_64.series' "$resolved")
 printf 'https://dl-cdn.alpinelinux.org/alpine/%s/main\nhttps://dl-cdn.alpinelinux.org/alpine/%s/community\n' "$series" "$series" >"$output/repositories"
 cp "$resolved" "$output/resolved.json"
-build_options=("${container_options[@]}")
-package_args=()
-if [[ -n ${UFLINUX_KERNEL_PACKAGES:-} ]]; then
-    snapshot=$(realpath -e "$UFLINUX_KERNEL_PACKAGES")
-    build_options+=(-v "$snapshot:/kernel-packages:ro")
-else
-    packages=$(kernel_packages "$resolved" "$builder")
-    mapfile -t package_args <<< "$packages"
+if [[ "$phase" != package ]]; then
+    build_image=$(alpine_image "$resolved" "$builder")
+    build_options=("${container_options[@]}")
+    package_args=()
+    if [[ -n ${UFLINUX_KERNEL_PACKAGES:-} ]]; then
+        snapshot=$(realpath -e "$UFLINUX_KERNEL_PACKAGES")
+        build_options+=(-v "$snapshot:/kernel-packages:ro")
+    else
+        packages=$(kernel_packages "$resolved" "$builder")
+        mapfile -t package_args <<< "$packages"
+    fi
+
+    # The literal script expands its arguments inside the Alpine build container.
+    # shellcheck disable=SC2016
+    "$runtime" run --rm "${build_options[@]}" --platform "$(jq -r --arg a "$builder" '.alpine[$a].platform | "linux/"+.' "$resolved")" \
+        -v "$repo:/builder:ro" -v "$output:/out" "$build_image" sh -ec '
+        cp /out/repositories /etc/apk/repositories
+        major=$1
+        target=$2
+        profile=$3
+        phase=$4
+        shift 4
+        if [ -d /kernel-packages ]; then
+            apk --no-network --repositories-file /dev/null add --no-progress /kernel-packages/*.apk
+        else
+            apk add --no-progress "$@"
+        fi
+        mkdir -p /opt/llvm-bin
+        for bin in clang clang++ ld.lld llvm-ar llvm-as llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip llvm-bolt llvm-profdata; do
+            for candidate in "/usr/lib/llvm$major/bin/$bin" "/usr/bin/$bin-$major" "/usr/bin/$bin"; do
+                if [ -x "$candidate" ]; then ln -sf "$candidate" "/opt/llvm-bin/$bin"; break; fi
+            done
+        done
+        export PATH="/out/bolt:/opt/llvm-bin:$PATH"
+        if [ -d /out/profiles ]; then export UFLINUX_PROFILE_DIR=/out/profiles; fi
+        if [ "$phase" = merge-pgo ]; then
+            exec python3 /builder/scripts/kernel_pgo.py /out /out/profiles llvm-profdata
+        fi
+        if [ -n "$profile" ]; then set -- "$profile"; else set --; fi
+        python3 /builder/scripts/build.py "$target" /out/resolved.json /out "$@"
+        ' sh "$major" "$target" "$profile" "$phase" "${package_args[@]}"
+
 fi
 
-# Prepare packaging tools before starting the long kernel compilation.
-if [[ "$profile" != --apply-collected-bolt ]]; then
+if [[ "$phase" == compile || "$phase" == merge-pgo ]]; then
+    exit 0
+fi
+
+package_image=$(alpine_image "$resolved" "$architecture")
+package_platform=$(jq -er --arg a "$architecture" '.alpine[$a].platform | "linux/"+.' "$resolved")
+if [[ ! -x "$output/apk-zstd" ]]; then
     # shellcheck disable=SC2016
     "$runtime" run --rm "${container_options[@]}" --platform "$package_platform" \
         -v "$repo:/builder:ro" -v "$output:/out" "$package_image" sh -ec '
@@ -103,32 +144,6 @@ if [[ "$profile" != --apply-collected-bolt ]]; then
         sh /builder/scripts/build-apk-zstd.sh "$1" "$2" /out
         ' sh "$aports_ref" "$series"
 fi
-
-# The literal script expands its arguments inside the Alpine build container.
-# shellcheck disable=SC2016
-"$runtime" run --rm "${build_options[@]}" --platform "$(jq -r --arg a "$builder" '.alpine[$a].platform | "linux/"+.' "$resolved")" \
-    -v "$repo:/builder:ro" -v "$output:/out" "$build_image" sh -ec '
-    cp /out/repositories /etc/apk/repositories
-    major=$1
-    target=$2
-    profile=$3
-    shift 3
-    if [ -d /kernel-packages ]; then
-        apk --no-network --repositories-file /dev/null add --no-progress /kernel-packages/*.apk
-    else
-        apk add --no-progress "$@"
-    fi
-    mkdir -p /opt/llvm-bin
-    for bin in clang clang++ ld.lld llvm-ar llvm-as llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip llvm-bolt; do
-        for candidate in "/usr/lib/llvm$major/bin/$bin" "/usr/bin/$bin-$major" "/usr/bin/$bin"; do
-            if [ -x "$candidate" ]; then ln -sf "$candidate" "/opt/llvm-bin/$bin"; break; fi
-        done
-    done
-    export PATH="/out/bolt:/opt/llvm-bin:$PATH"
-    if [ -d /out/profiles ]; then export UFLINUX_PROFILE_DIR=/out/profiles; fi
-    if [ -n "$profile" ]; then set -- "$profile"; else set --; fi
-    python3 /builder/scripts/build.py "$target" /out/resolved.json /out "$@"
-    ' sh "$major" "$target" "$profile" "${package_args[@]}"
 
 "$runtime" run --rm "${container_options[@]}" --platform "$package_platform" \
     -v "$repo:/builder:ro" -v "$output:/out" "$package_image" sh -ec '

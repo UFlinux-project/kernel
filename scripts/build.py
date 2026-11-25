@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 
+import kernel_pgo
 from resolve import ROOT, fetch
 
 
@@ -80,22 +81,7 @@ def bbr_default(kernel, name, symbol):
     return selector
 
 
-def enable_arm64_autofdo(kernel):
-    # Older vendor trees still require the architecture opt-in for AutoFDO.
-    if not re.search(r"^\s*depends on ARCH_SUPPORTS_AUTOFDO_CLANG\s*$",
-                     (kernel / "arch/Kconfig").read_text(), re.M):
-        return
-    kconfig = kernel / "arch/arm64/Kconfig"
-    text = kconfig.read_text()
-    opt_in = "\tselect ARCH_SUPPORTS_AUTOFDO_CLANG\n"
-    if opt_in not in text:
-        marker = "\tselect ARCH_SUPPORTS_LTO_CLANG_THIN\n"
-        if text.count(marker) != 1:
-            raise SystemExit("ARM64 AutoFDO Kconfig layout changed")
-        kconfig.write_text(text.replace(marker, marker + opt_in))
-
-
-def configure(kernel, obj, target, name, kbuild, bbr, autofdo, gcc=False):
+def configure(kernel, obj, target, name, kbuild, bbr, gcc=False):
     config = obj / ".config"
     if "config_url" in target:
         get(target["config_url"], config)
@@ -143,7 +129,7 @@ def configure(kernel, obj, target, name, kbuild, bbr, autofdo, gcc=False):
                    "-e", "DRM", "-m", "DRM_VIRTIO_GPU", "-e", "DEVTMPFS", "-e", "BLK_DEV_INITRD",
                    "-e", "EXT4_FS", "-e", "SERIAL_8250_CONSOLE" if target["arch"] == "x86"
                    else "SERIAL_AMBA_PL011_CONSOLE")
-    set_config("-e" if autofdo else "-d", "AUTOFDO_CLANG", "-d", "LTO_CLANG_FULL")
+    set_config("-d", "AUTOFDO_CLANG", "-d", "LTO_CLANG_FULL")
     if re.search(r"^config SCHED_BORE\b", (kernel / "init/Kconfig").read_text(), re.M):
         set_config("-e", "SCHED_BORE")
     if not gcc:
@@ -170,7 +156,7 @@ def configure(kernel, obj, target, name, kbuild, bbr, autofdo, gcc=False):
 
 def profile(name, kind, target):
     folder = Path(os.environ.get("UFLINUX_PROFILE_DIR", ROOT / "profiles" / name))
-    path = folder / ("kernel.afdo" if kind == "autofdo" else "kernel.fdata")
+    path = folder / ("kernel.profdata" if kind == "pgo" else "kernel.fdata")
     metadata = folder / f"{kind}.json"
     if not path.is_file() or not metadata.is_file():
         return None, {}
@@ -180,6 +166,10 @@ def profile(name, kind, target):
     if data.get("source") != target["ref"] or data.get("sha256") != checksum:
         return None, {}
     return path, data
+
+
+def pgo_flags(path):
+    return f"UFLINUX_PGO_FLAGS=-fprofile-use={path} {kernel_pgo.COUNTER_FLAGS} -Werror=profile-instr-out-of-date"
 
 
 def bolt_hook(kernel, x86, *, reuse_link=False):
@@ -298,13 +288,14 @@ def write_build_metadata(output, name, metadata):
 def apply_collected_bolt(output, name, target, kbuild):
     kernel, obj = output / "kernel", output / "obj"
     metadata = json.loads((output / "build.json").read_text())
-    afdo, afdo_data = profile(name, "autofdo", target)
+    pgo, pgo_data = profile(name, "pgo", target)
     bolt, bolt_data = profile(name, "bolt", target)
     optimizer = shutil.which("llvm-bolt")
-    if (metadata["target"] != name or metadata["source"] != target["ref"] or not metadata["autofdo"]
-            or not afdo or afdo_data.get("config_sha256") != metadata["config_sha256"]
+    if (metadata["target"] != name or metadata["source"] != target["ref"] or not metadata["pgo"]
+            or not pgo or pgo_data.get("identity") != metadata["pgo_identity"]
+            or pgo_data.get("sha256") != metadata.get("pgo_sha256")
             or not bolt or not bolt_data.get("build_id") or not optimizer):
-        raise SystemExit(f"{name}: missing AutoFDO build or matching BOLT inputs")
+        raise SystemExit(f"{name}: missing PGO build or matching BOLT inputs")
     bundled_optimizer = Path(optimizer).parent / "lib/optimizer"
     with (bundled_optimizer if bundled_optimizer.is_file() else Path(optimizer)).open("rb") as stream:
         if hashlib.file_digest(stream, "sha256").hexdigest() != bolt_data.get("rewriter_sha256"):
@@ -312,6 +303,12 @@ def apply_collected_bolt(output, name, target, kbuild):
     with (obj / "vmlinux.unstripped").open("rb") as stream:
         if hashlib.file_digest(stream, "sha256").hexdigest() != bolt_data.get("input_sha256"):
             raise SystemExit(f"{name}: the linked ELF differs from the profiled ELF")
+    notes = run("readelf", "-n", str(obj / "vmlinux.unstripped"), capture=True)
+    build_id = re.search(r"Build ID: ([0-9a-f]+)", notes)
+    if not build_id or build_id[1] != bolt_data["build_id"]:
+        raise SystemExit(f"{name}: the linked ELF build ID differs from the profiled ELF")
+    if kernel_pgo.checksum(obj / ".config") != metadata["config_sha256"]:
+        raise SystemExit(f"{name}: the kernel configuration changed before BOLT repack")
 
     x86 = target["arch"] == "x86"
     if not bolt_hook(kernel, x86, reuse_link=True):
@@ -323,14 +320,21 @@ def apply_collected_bolt(output, name, target, kbuild):
     flags = ["KCFLAGS=-O3"] if metadata["optimization"] == "-O3" else []
     image = obj / target["image"]
     jobs = f"-j{min(4, os.cpu_count() or 1)}"
-    run(*kbuild, f"CLANG_AUTOFDO_PROFILE={afdo}", *flags, jobs, image.name, "modules")
+    run(*kbuild, pgo_flags(pgo), *flags, jobs, image.name)
     if not (obj / ".uflinux-bolt-applied").is_file():
         raise SystemExit(f"{name}: BOLT did not rewrite the profiled kernel")
+
+    sections = run("readelf", "-SW", str(obj / "vmlinux.unstripped"), capture=True)
+    if ".note.bolt_info" not in sections:
+        raise SystemExit(f"{name}: missing BOLT note after boot image regeneration")
 
     boot = output / "stage" / "boot"
     shutil.copy2(image, boot / f"vmlinuz-uflinux-{name}")
     shutil.copy2(obj / "System.map", boot / f"System.map-uflinux-{name}")
     metadata["bolt"] = True
+    metadata["bolt_input_sha256"] = bolt_data["input_sha256"]
+    metadata["bolt_profile_sha256"] = bolt_data["sha256"]
+    metadata["bolt_rewriter_sha256"] = bolt_data["rewriter_sha256"]
     metadata["omissions"].pop("BOLT", None)
     write_build_metadata(output, name, metadata)
 
@@ -342,6 +346,8 @@ def main():
     parser.add_argument("output", type=Path)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--profile-build", action="store_true")
+    mode.add_argument("--bolt-baseline", action="store_true")
+    mode.add_argument("--pgo-build", action="store_true")
     mode.add_argument("--prepare-only", action="store_true")
     mode.add_argument("--apply-collected-bolt", action="store_true")
     args = parser.parse_args()
@@ -389,23 +395,37 @@ def main():
         print(json.dumps(records, indent=2))
         return
 
-    afdo, afdo_data = profile(name, "autofdo", target)
+    pgo, pgo_data = profile(name, "pgo", target)
     bolt, bolt_data = profile(name, "bolt", target)
-    if target["arch"] == "arm64" and (afdo or args.profile_build):
-        enable_arm64_autofdo(kernel)
-    settings = configure(kernel, obj, target, name, kbuild, bbr, bool(afdo) or args.profile_build, gcc)
-    baseline_config = hashlib.sha256((obj / ".config").read_bytes()).hexdigest()
-    if afdo and afdo_data.get("config_sha256") != baseline_config:
-        afdo = None
-        settings = configure(kernel, obj, target, name, kbuild, bbr, args.profile_build, gcc)
-    if afdo and settings.get("AUTOFDO_CLANG") == "y":
-        kbuild.append(f"CLANG_AUTOFDO_PROFILE={afdo}")
-    else:
-        afdo = None
+    settings = configure(kernel, obj, target, name, kbuild, bbr, gcc)
+    flags = ["KCFLAGS=-O3"] if not target.get("disable_o3") else []
+    compiler = run("gcc" if gcc else "clang", "--version", capture=True).splitlines()[0]
+    identity = {
+        "target": name, "source": target["ref"], "patches": records,
+        "instrumentation_sha256": kernel_pgo.checksum(Path(kernel_pgo.__file__)),
+        "exporter_sha256": kernel_pgo.checksum(Path(kernel_pgo.__file__).with_name("kernel-pgo.c")),
+        "config_sha256": kernel_pgo.checksum(obj / ".config"), "compiler": compiler,
+        "optimization": flags,
+    }
+    if args.profile_build or (pgo and pgo_data.get("identity") != identity):
+        pgo = None
+    if (args.pgo_build or args.bolt_baseline) and not pgo:
+        raise SystemExit(f"{name}: the requested build requires a matching PGO profile")
+    if args.profile_build or pgo:
+        version = re.search(r"clang version (\d+)\.", compiler)
+        if not version or int(version[1]) not in kernel_pgo.RAW_FORMATS:
+            raise SystemExit(f"{name}: unsupported compiler for kernel instrumentation PGO: {compiler}")
+        kernel_pgo.install(kernel, args.profile_build)
+        if args.profile_build:
+            if settings.get("PROC_FS") != "y":
+                raise SystemExit(f"{name}: PGO collection requires PROC_FS")
+            kbuild.append(f"UFLINUX_PGO_FLAGS={kernel_pgo.COLLECTION_FLAGS}")
+        else:
+            kbuild.append(pgo_flags(pgo))
     x86 = target["apk"] == "x86_64"
     if x86:
         bug_entry_size = x86_bug_entry_size(kernel, settings)
-    if (bolt and not args.profile_build and target["apk"] in {"x86_64", "aarch64"}
+    if (bolt and not (args.profile_build or args.bolt_baseline) and target["apk"] in {"x86_64", "aarch64"}
             and bolt_data.get("build_id") and shutil.which("llvm-bolt") and bolt_hook(kernel, x86)):
         os.environ.update(UFLINUX_BOLT_PROFILE=str(bolt), UFLINUX_BOLT_BUILD_ID=bolt_data["build_id"])
         if x86:
@@ -422,7 +442,6 @@ def main():
         raise SystemExit("zram and zswap must default to Zstandard")
     if "ZRAM_BACKEND_LZ4" in settings and "ZRAM_BACKEND_ZSTD" not in settings:
         raise SystemExit("Missing zram Zstandard backend")
-    flags = ["KCFLAGS=-O3"] if not target.get("disable_o3") else []
     image = obj / target["image"]
     goals = [image.name, "modules"]
     if target["arch"] != "x86" and not name.startswith("virt-"):
@@ -432,7 +451,7 @@ def main():
     try:
         run(*kbuild, *flags, jobs, *goals)
     except subprocess.CalledProcessError:
-        if not flags:
+        if not flags or pgo or args.profile_build:
             raise
         print("Build failed at -O3, retrying with Kbuild's optimization level", flush=True)
         (obj / ".uflinux-bolt-applied").unlink(missing_ok=True)
@@ -449,12 +468,16 @@ def main():
     abi = run(*kbuild, "-s", "kernelrelease", capture=True).strip()
     stage(kernel, obj, output / "stage", name, target, kbuild, image, abi)
     shutil.copy2(obj / ".config", output / "kernel.config")
-    if args.profile_build:
+    if args.profile_build or args.bolt_baseline:
         unstripped = obj / "vmlinux.unstripped"
+        if args.bolt_baseline and not unstripped.is_file():
+            raise SystemExit(f"{name}: missing the unstripped ELF needed for BOLT")
         shutil.copy2(unstripped if unstripped.is_file() else obj / "vmlinux", output / "vmlinux")
+        if args.profile_build:
+            kernel_pgo.elf_regions(output / "vmlinux")
     bolt_applied = (obj / ".uflinux-bolt-applied").exists()
-    if not afdo:
-        omissions["AutoFDO"] = "No compatible UFlinux sample profile or Kconfig support"
+    if not pgo:
+        omissions["PGO"] = "No matching UFlinux instrumentation profile"
     if not bolt_applied:
         omissions["BOLT"] = "No compatible Linux kernel rewriter or exact matching profile, or BOLT failed"
     if settings.get("LTO_CLANG_THIN_DIST") != "y":
@@ -463,13 +486,14 @@ def main():
         omissions["MGLRU"] = "No MGLRU boot-default support in the effective Kconfig"
     metadata = {"target": name, "arch": target["apk"], "version": target["version"],
                 "source": target["ref"], "source_url": target["url"], "abi": abi, "patches": records,
-                "autofdo": bool(afdo), "bolt": bolt_applied, "omissions": omissions,
+                "pgo": bool(pgo), "pgo_instrumented": args.profile_build, "bolt": bolt_applied, "omissions": omissions,
                 "bbrv3": bbr[0], "mglru": settings.get("LRU_GEN_ENABLED") == "y",
                 "lto": next((key for key in ("LTO_CLANG_THIN_DIST", "LTO_CLANG_THIN") if settings.get(key) == "y"), "none"),
                 "optimization": "-O3" if flags else "Kbuild default",
                 "config_sha256": hashlib.sha256((obj / ".config").read_bytes()).hexdigest(),
-                "compiler": run("gcc" if gcc else "clang", "--version", capture=True).splitlines()[0]}
-    if args.profile_build and x86:
+                "compiler": compiler, "pgo_identity": identity,
+                "pgo_sha256": pgo_data["sha256"] if pgo else None}
+    if args.bolt_baseline and x86:
         metadata["bolt_bug_entry_size"] = bug_entry_size
     write_build_metadata(output, name, metadata)
 

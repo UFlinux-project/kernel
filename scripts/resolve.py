@@ -187,16 +187,15 @@ def llvm():
             continue
         stable[tuple(int(part) for part in match.groups())] = release
     for major in sorted({numbers[0] for numbers in stable}, reverse=True):
-        apt = {arch: llvm_apt_packages(major, arch) for arch in ("x86_64", "aarch64")}
-        if not all(packages and len(set(packages.values())) == 1 for packages in apt.values()):
+        packages = llvm_apt_packages(major, "x86_64")
+        if not packages or len(set(packages.values())) != 1:
             continue
-        upstream_versions = {
-            match[1] if (match := re.match(r"(?:\d+:)?(\d+\.\d+\.\d+)(?=[~+\-]|$)", version)) else None
-            for packages in apt.values() for version in packages.values()
-        }
-        if len(upstream_versions) != 1 or None in upstream_versions:
+        package_version = next(iter(packages.values()))
+        match = re.match(r"(?:\d+:)?(\d+\.\d+\.\d+)(?=[~+\-]|$)", package_version)
+        if not match:
             continue
-        version = upstream_versions.pop()
+        apt = {"x86_64": packages}
+        version = match[1]
         release = stable.get(tuple(map(int, version.split("."))))
         if release is None:
             continue

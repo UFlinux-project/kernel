@@ -33,8 +33,10 @@ jobs:
     outputs:
       matrix: ${{ steps.sources.outputs.matrix }}
       profile_matrix: ${{ steps.sources.outputs.profile_matrix }}
+      bolt_matrix: ${{ steps.sources.outputs.bolt_matrix }}
       fingerprint: ${{ steps.sources.outputs.fingerprint }}
       build: ${{ steps.sources.outputs.build }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -44,6 +46,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PROFILE_TARGET: ${{ inputs.profile_target || 'none' }}
           GENERATE_PROFILES: ${{ inputs.generate_release_profiles }}
+          ARM_BOLT: ${{ vars.KERNEL_AARCH64_BOLT_RUNNER }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           if [[ "$GENERATE_PROFILES" == true && ( "$PROFILE_TARGET" != none || "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ) ]]; then
@@ -59,6 +62,7 @@ jobs:
             profile:(.value.source == "stable" and (.value.apk == "x86_64" or .value.apk == "aarch64"))
           }]}' work/resolved.json)
           profile_matrix=$(jq -c '{include:[.include[]|select(.profile)]}' <<< "$matrix")
+          bolt_matrix=$(jq -c --arg arm "$ARM_BOLT" '{include:[.include[]|select(.builder == "x86_64" or $arm != "")]}' <<< "$profile_matrix")
           source_hash=$(jq -r .fingerprint work/resolved.json)
           recipe_hash=$(git ls-tree -r HEAD -- scripts patches profiles targets.json .github/workflows/kernels.yml | sha256sum | cut -d' ' -f1)
           fingerprint=$(printf '%s\n%s\n' "$source_hash" "$recipe_hash" | sha256sum | cut -d' ' -f1)
@@ -67,7 +71,7 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" == schedule ]] && gh release view "$tag" --json isDraft --jq '.isDraft' | grep -qx false; then
             build=false
           fi
-          printf 'matrix=%s\nprofile_matrix=%s\nfingerprint=%s\nbuild=%s\n' "$matrix" "$profile_matrix" "$fingerprint" "$build" >> "$GITHUB_OUTPUT"
+          printf 'matrix=%s\nprofile_matrix=%s\nbolt_matrix=%s\nfingerprint=%s\nbuild=%s\n' "$matrix" "$profile_matrix" "$bolt_matrix" "$fingerprint" "$build" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         with:
           name: resolved-inputs
@@ -87,6 +91,7 @@ jobs:
           - arch: aarch64
             runner: ubuntu-26.04-arm
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -109,20 +114,60 @@ jobs:
           compression-level: 0
           overwrite: true
 
-  profile-release:
+  bolt-tool:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true' && inputs.generate_release_profiles
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: resolved-inputs
+          path: work
+      - name: Install pinned LLVM tools
+        env:
+          BUILDER_ARCH: x86_64
+        run: |
+          major=$(jq -er '.llvm.major' work/resolved.json)
+          packages=(cmake ninja-build g++ libzstd-dev zlib1g-dev)
+          codename=$(jq -er '.llvm.apt_codename' work/resolved.json)
+          test "$codename" = "$(. /etc/os-release && echo "$VERSION_CODENAME")"
+          llvm_pins=$(jq -er --arg arch "$BUILDER_ARCH" '
+            .llvm.apt_packages[$arch] | to_entries[] | "\(.key)=\(.value)"
+          ' work/resolved.json)
+          mapfile -t llvm_packages <<< "$llvm_pins"
+          curl -fsSL --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key |
+              sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
+          echo "deb https://apt.llvm.org/$codename llvm-toolchain-$codename-$major main" |
+              sudo tee "/etc/apt/sources.list.d/llvm-$major.list" > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "${packages[@]}" "${llvm_packages[@]}"
+      - name: Build and bundle the x86 kernel rewriter
+        run: |
+          scripts/build-kernel-bolt.sh work/kernel-bolt work/resolved.json
+          UFLINUX_BOLT_BINARY="$PWD/work/kernel-bolt/llvm-bolt" \
+            scripts/prepare-bolt.sh x86_64 work/bolt-tool --bundle
+          tar -C work/bolt-tool -cf work/bolt-tool.tar bolt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bolt-tool-x86
+          path: work/bolt-tool.tar
+          if-no-files-found: error
+          overwrite: true
+
+  profile-compile:
     needs: [resolve, kernel-builders]
     if: needs.resolve.outputs.build == 'true' && inputs.generate_release_profiles
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.profile_matrix) }}
-    runs-on: >-
-      ${{ matrix.runner == 'ubuntu-26.04-arm'
-          && vars.KERNEL_AARCH64_BOLT_RUNNER
-          || matrix.runner }}
-    timeout-minutes: 360
+    runs-on: ${{ matrix.builder == 'aarch64' && vars.KERNEL_AARCH64_BUILD_RUNNER || matrix.runner }}
+    timeout-minutes: 330
     env:
       TARGET: ${{ matrix.target }}
-      UFLINUX_PKGREL: ${{ github.run_number }}
       UFLINUX_KERNEL_PACKAGES: work/kernel-packages
     steps:
       - uses: actions/checkout@v7
@@ -136,69 +181,67 @@ jobs:
         with:
           name: alpine-build-deps-${{ matrix.builder }}
           path: work/kernel-packages
-      - name: Install profiling tools
-        env:
-          BUILDER_ARCH: ${{ matrix.builder }}
+      - name: Compile collection kernel
         run: |
-          major=$(jq -er '.llvm.major' work/resolved.json)
-          packages=(qemu-system-x86 cmake ninja-build g++ libzstd-dev zlib1g-dev)
-          if [[ "$TARGET" == *aarch64 ]]; then
-            packages=(qemu-system-arm)
-          fi
-          codename=$(jq -er '.llvm.apt_codename' work/resolved.json)
-          test "$codename" = "$(. /etc/os-release && echo "$VERSION_CODENAME")"
-          llvm_pins=$(jq -er --arg arch "$BUILDER_ARCH" '
-            .llvm.apt_packages[$arch] | to_entries[] | "\(.key)=\(.value)"
-          ' work/resolved.json)
-          mapfile -t llvm_packages <<< "$llvm_pins"
-          curl -fsSL --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key |
-              sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
-          echo "deb https://apt.llvm.org/$codename llvm-toolchain-$codename-$major main" |
-              sudo tee "/etc/apt/sources.list.d/llvm-$major.list" > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends "${packages[@]}" "${llvm_packages[@]}" gcc pkg-config libglib2.0-dev
-      - name: Collect AutoFDO and BOLT profiles with QEMU TCG
-        env:
-          AARCH64_BOLT_RUNNER: ${{ vars.KERNEL_AARCH64_BOLT_RUNNER }}
-        run: |
-          major=$(jq -er '.llvm.major' work/resolved.json)
-          bolt=
-          case "$TARGET" in
-            *x86_64)
-              scripts/build-kernel-bolt.sh work/kernel-bolt work/resolved.json
-              bolt="$PWD/work/kernel-bolt/llvm-bolt"
-              ;;
-            *aarch64)
-              if [[ -n "$AARCH64_BOLT_RUNNER" ]]; then
-                bolt=$(command -v llvm-bolt)
-              else
-                echo "Collecting AutoFDO for $TARGET. Set KERNEL_AARCH64_BOLT_RUNNER to enable BOLT."
-              fi
-              ;;
-          esac
-          if [[ -n "$bolt" ]]; then
-            UFLINUX_BOLT_BINARY="$bolt" scripts/prepare-bolt.sh "$TARGET" work/release-profiles --bundle
-          fi
-          scripts/collect-release-profiles.sh work/resolved.json work/release-profiles \
-            "llvm-profgen-$major" "$bolt" "llvm-profdata-$major" "$TARGET" work/profiled-kernel
+          export UFLINUX_KERNEL_PHASE=compile
+          time scripts/container.sh "$TARGET" work/resolved.json "work/$TARGET" --profile-build
+          time tar -C "work/$TARGET" -I 'zstd -T2 -3' -cf work/collection.tar.zst \
+            stage kernel.config build.json vmlinux
       - uses: actions/upload-artifact@v7
         with:
-          name: release-profiles-${{ matrix.target }}
-          path: work/release-profiles
-          if-no-files-found: error
-          overwrite: true
-      - uses: actions/upload-artifact@v7
-        if: matrix.builder == 'x86_64' || vars.KERNEL_AARCH64_BOLT_RUNNER != ''
-        with:
-          name: profiled-kernel-${{ matrix.target }}
-          path: work/profiled-kernel
-          if-no-files-found: error
+          name: collection-${{ matrix.target }}
+          path: work/collection.tar.zst
           compression-level: 0
+          if-no-files-found: error
           overwrite: true
 
-  build:
-    needs: [resolve, profile-release]
-    if: ${{ !cancelled() && needs.resolve.outputs.build == 'true' && (needs.profile-release.result == 'success' || (!inputs.generate_release_profiles && needs.profile-release.result == 'skipped')) }}
+  profile-collect:
+    needs: [resolve, kernel-builders, profile-compile]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.profile_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      TARGET: ${{ matrix.target }}
+      UFLINUX_KERNEL_PACKAGES: work/kernel-packages
+      UFLINUX_PKGREL: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: resolved-inputs
+          path: work
+      - name: Install emulators
+        run: scripts/install-emulators.sh "$TARGET"
+      - uses: actions/download-artifact@v8
+        with:
+          name: alpine-build-deps-${{ matrix.builder }}
+          path: work/kernel-packages
+      - uses: actions/download-artifact@v8
+        with:
+          name: collection-${{ matrix.target }}
+          path: work
+      - name: Train collection kernel
+        run: |
+          mkdir -p "work/$TARGET"
+          tar -xf work/collection.tar.zst -C "work/$TARGET"
+          UFLINUX_KERNEL_PHASE=package UFLINUX_PROFILE_GUEST=1 \
+            scripts/container.sh "$TARGET" work/resolved.json "work/$TARGET"
+          time scripts/collect-release-profiles.sh work/resolved.json "work/$TARGET/profiles" "$TARGET" pgo "work/$TARGET"
+          time env UFLINUX_KERNEL_PHASE=merge-pgo scripts/container.sh "$TARGET" work/resolved.json "work/$TARGET"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: compiler-profile-${{ matrix.target }}
+          path: work/${{ matrix.target }}/profiles
+          if-no-files-found: error
+          overwrite: true
+
+  compile:
+    needs: [resolve, kernel-builders, profile-collect]
+    if: ${{ !cancelled() && needs.resolve.outputs.build == 'true' && (needs.profile-collect.result == 'success' || (!inputs.generate_release_profiles && needs.profile-collect.result == 'skipped')) }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
@@ -206,9 +249,149 @@ jobs:
       ${{ matrix.runner == 'ubuntu-26.04-arm'
           && github.event_name != 'pull_request'
           && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-          && vars.KERNEL_AARCH64_BUILD_RUNNER
-          || matrix.runner }}
-    timeout-minutes: 300
+          && vars.KERNEL_AARCH64_BUILD_RUNNER || matrix.runner }}
+    timeout-minutes: 330
+    env:
+      TARGET: ${{ matrix.target }}
+      PROFILE_TARGET: ${{ inputs.profile_target || 'none' }}
+      REQUIRE_PROFILE: ${{ matrix.profile && inputs.generate_release_profiles }}
+      BOLT_RELEASE: ${{ matrix.profile && inputs.generate_release_profiles && (matrix.builder == 'x86_64' || vars.KERNEL_AARCH64_BOLT_RUNNER != '') }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: resolved-inputs
+          path: work
+      - uses: actions/download-artifact@v8
+        if: inputs.generate_release_profiles
+        with:
+          name: alpine-build-deps-${{ matrix.builder }}
+          path: work/kernel-packages
+      - uses: actions/download-artifact@v8
+        if: env.REQUIRE_PROFILE == 'true'
+        with:
+          name: compiler-profile-${{ matrix.target }}
+          path: work/${{ matrix.target }}/profiles
+      - name: Compile and stage kernel
+        run: |
+          args=()
+          [[ ! -d work/kernel-packages ]] || export UFLINUX_KERNEL_PACKAGES=work/kernel-packages
+          if [[ "$PROFILE_TARGET" != none ]]; then
+            args+=(--profile-build)
+          elif [[ "$BOLT_RELEASE" == true ]]; then
+            args+=(--bolt-baseline)
+          elif [[ "$REQUIRE_PROFILE" == true ]]; then
+            args+=(--pgo-build)
+          fi
+          if [[ "$REQUIRE_PROFILE" != true ]]; then
+            if ! scripts/prepare-bolt.sh "$TARGET" "work/$TARGET"; then
+              rm -f "work/$TARGET/bolt/llvm-bolt"
+              echo "::warning::BOLT tool unavailable for $TARGET"
+            fi
+          fi
+          export UFLINUX_KERNEL_PHASE=compile
+          time scripts/container.sh "$TARGET" work/resolved.json "work/$TARGET" "${args[@]}"
+          if [[ "$REQUIRE_PROFILE" == true ]]; then
+            jq -e '.pgo == true' "work/$TARGET/build.json"
+          fi
+          files=(stage kernel.config build.json "source-$TARGET.tar.zst")
+          if [[ "$BOLT_RELEASE" == true ]]; then
+            files=(stage kernel.config build.json kernel obj profiles vmlinux)
+          elif [[ "$PROFILE_TARGET" != none ]]; then
+            files+=(vmlinux)
+          fi
+          time tar --format=posix -C "work/$TARGET" -I 'zstd -T2 -3' -cf work/compiled.tar.zst "${files[@]}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: compiled-${{ matrix.target }}
+          path: work/compiled.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+
+  bolt:
+    needs: [resolve, compile, bolt-tool]
+    if: inputs.generate_release_profiles
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.bolt_matrix) }}
+    runs-on: ${{ matrix.builder == 'aarch64' && vars.KERNEL_AARCH64_BOLT_RUNNER || matrix.runner }}
+    timeout-minutes: 60
+    env:
+      TARGET: ${{ matrix.target }}
+      UFLINUX_PKGREL: ${{ github.run_number }}
+      UFLINUX_KERNEL_PACKAGES: work/kernel-packages
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: resolved-inputs
+          path: work
+      - name: Install emulators
+        run: scripts/install-emulators.sh "$TARGET"
+      - uses: actions/download-artifact@v8
+        with:
+          name: alpine-build-deps-${{ matrix.builder }}
+          path: work/kernel-packages
+      - uses: actions/download-artifact@v8
+        if: matrix.builder == 'x86_64'
+        with:
+          name: bolt-tool-x86
+          path: work
+      - uses: actions/download-artifact@v8
+        with:
+          name: compiled-${{ matrix.target }}
+          path: work
+      - name: Install QEMU plugin build tools
+        run: sudo apt-get install -y --no-install-recommends gcc pkg-config libglib2.0-dev
+      - name: Profile and rewrite the exact kernel ELF
+        run: |
+          output="work/$TARGET"
+          mkdir -p "$output"
+          time tar --same-permissions -xf work/compiled.tar.zst -C "$output"
+          if [[ "$TARGET" == *x86_64 ]]; then
+            tar -xf work/bolt-tool.tar -C "$output"
+          else
+            command -v llvm-bolt
+            UFLINUX_BOLT_BINARY="$(command -v llvm-bolt)" scripts/prepare-bolt.sh "$TARGET" "$output" --bundle
+          fi
+          UFLINUX_KERNEL_PHASE=package UFLINUX_PROFILE_GUEST=1 \
+            scripts/container.sh "$TARGET" work/resolved.json "$output"
+          # The bundled launcher and optimizer are also mounted in the build container.
+          time scripts/collect-release-profiles.sh work/resolved.json "$output/profiles" \
+            "$TARGET" bolt "$output" "$PWD/$output/bolt/llvm-bolt"
+          time env UFLINUX_KERNEL_PHASE=compile scripts/container.sh "$TARGET" work/resolved.json "$output" --apply-collected-bolt
+          jq -e '.pgo and .bolt' "$output/build.json"
+          time tar -C "$output" -I 'zstd -T2 -3' -cf work/rewritten.tar.zst \
+            stage kernel.config build.json "source-$TARGET.tar.zst"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rewritten-${{ matrix.target }}
+          path: work/rewritten.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bolt-profile-${{ matrix.target }}
+          path: |
+            work/${{ matrix.target }}/profiles/bolt.json
+            work/${{ matrix.target }}/profiles/kernel.fdata
+          if-no-files-found: error
+          overwrite: true
+
+  build:
+    needs: [resolve, compile, bolt]
+    if: ${{ !cancelled() && needs.compile.result == 'success' && (needs.bolt.result == 'success' || (!inputs.generate_release_profiles && needs.bolt.result == 'skipped')) }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     env:
       TARGET: ${{ matrix.target }}
       PROFILE_TARGET: ${{ inputs.profile_target || 'none' }}
@@ -222,78 +405,21 @@ jobs:
         with:
           name: resolved-inputs
           path: work
-      - uses: actions/download-artifact@v8
-        if: env.BOLT_RELEASE == 'true'
-        with:
-          name: profiled-kernel-${{ matrix.target }}
-          path: work/${{ matrix.target }}
       - name: Install emulators
-        if: env.BOLT_RELEASE != 'true'
-        run: |
-          case "$TARGET" in
-            orangepi-rv2)
-              sudo apt-get update
-              if apt-cache show qemu-user-static 2>/dev/null | grep '^Package: qemu-user-static$' >/dev/null; then
-                sudo apt-get install -y qemu-user-static binfmt-support
-              else
-                sudo apt-get install -y qemu-user-binfmt
-              fi
-              if [[ ! -r /proc/sys/fs/binfmt_misc/qemu-riscv64 ]]; then
-                sudo systemctl restart systemd-binfmt
-              fi
-              grep -Eq '^flags:.*F' /proc/sys/fs/binfmt_misc/qemu-riscv64
-              ;;
-            aarch64|virt-aarch64)
-              sudo apt-get update
-              sudo apt-get install -y qemu-system-arm
-              ;;
-            x86_64|virt-x86_64)
-              sudo apt-get update
-              sudo apt-get install -y qemu-system-x86
-              ;;
-          esac
+        run: scripts/install-emulators.sh "$TARGET"
       - uses: actions/download-artifact@v8
-        if: env.BOLT_RELEASE != 'true' && matrix.profile && inputs.generate_release_profiles
         with:
-          name: release-profiles-${{ matrix.target }}
-          path: work/${{ matrix.target }}/profiles
-      - uses: actions/download-artifact@v8
-        if: env.BOLT_RELEASE != 'true' && inputs.generate_release_profiles
-        with:
-          name: alpine-build-deps-${{ matrix.builder }}
-          path: work/kernel-packages
-      - name: Build and install-test APK
-        if: env.BOLT_RELEASE != 'true'
-        env:
-          RELEASE_PROFILES: ${{ inputs.generate_release_profiles }}
+          name: ${{ env.BOLT_RELEASE == 'true' && 'rewritten' || 'compiled' }}-${{ matrix.target }}
+          path: work
+      - name: Package and install-test kernel
         run: |
-          args=()
-          if [[ "$RELEASE_PROFILES" == true ]]; then
-            export UFLINUX_KERNEL_PACKAGES=work/kernel-packages
-          fi
-          if [[ "$PROFILE_TARGET" != none ]]; then
-            args+=(--profile-build)
-          else
-            if ! scripts/prepare-bolt.sh "$TARGET" "work/$TARGET"; then
-              rm -f "work/$TARGET/bolt/llvm-bolt"
-              echo "::warning::BOLT tool unavailable for $TARGET"
-            fi
-          fi
-          scripts/container.sh "$TARGET" work/resolved.json "work/$TARGET" "${args[@]}"
-      - name: Verify generated profiles were applied
-        if: matrix.profile && inputs.generate_release_profiles
-        run: |
-          if ! jq -e '.autofdo' "work/$TARGET/build.json" >/dev/null; then
-            echo "::error::The release kernel did not apply its generated AutoFDO profile"
-            exit 1
-          fi
-          if [[ "$BOLT_RELEASE" == true ]] && ! jq -e '.bolt' "work/$TARGET/build.json" >/dev/null; then
-            echo "::error::The release kernel did not apply its generated BOLT profile"
-            exit 1
-          fi
-      - name: Boot generic and guest kernels
-        if: env.BOLT_RELEASE != 'true'
-        run: scripts/boot-test.sh "$TARGET" "work/$TARGET"
+          mkdir -p "work/$TARGET"
+          archive=compiled
+          [[ "$BOLT_RELEASE" != true ]] || archive=rewritten
+          time tar -xf "work/$archive.tar.zst" -C "work/$TARGET"
+          time env UFLINUX_KERNEL_PHASE=package scripts/container.sh "$TARGET" work/resolved.json "work/$TARGET"
+      - name: Boot-test packaged kernel
+        run: time scripts/boot-test.sh "$TARGET" "work/$TARGET"
       - name: Collect release files
         run: |
           mkdir -p dist
@@ -351,6 +477,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       TARGET_ARCH: ${{ matrix.arch }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -392,7 +519,7 @@ jobs:
           ' sh "$series" "$TARGET_ARCH"
 
   publish:
-    needs: [resolve, profile-release, build, coexist]
+    needs: [resolve, build, coexist]
     if: ${{ !cancelled() && needs.build.result == 'success' && needs.coexist.result == 'success' && github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch && (inputs.profile_target == 'none' || inputs.profile_target == '') }}
     runs-on: ubuntu-26.04
     concurrency:
@@ -404,6 +531,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       FINGERPRINT: ${{ needs.resolve.outputs.fingerprint }}
       GENERATED_PROFILES: ${{ inputs.generate_release_profiles }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -420,7 +548,7 @@ jobs:
       - uses: actions/download-artifact@v8
         if: inputs.generate_release_profiles
         with:
-          pattern: release-profiles-*
+          pattern: "*-profile-*"
           path: work/release-profiles
       - name: Check release assets
         run: |

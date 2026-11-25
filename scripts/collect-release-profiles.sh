@@ -3,11 +3,15 @@ set -euo pipefail
 
 resolved=$(realpath "${1:?Specify resolved inputs}")
 profiles=$(realpath -m "${2:?Specify the profile output directory}")
-profgen=${3:?Specify llvm-profgen}
-bolt=${4?Specify llvm-bolt or pass an empty string for AutoFDO only}
-profdata=${5:?Specify llvm-profdata}
-target=${6:-virt-x86_64}
-release_output=${7:-}
+target=${3:?Specify a target}
+mode=${4:?Specify pgo or bolt}
+output=$(realpath -e "${5:?Specify the compiled kernel directory}")
+bolt=${6:-}
+case "$mode" in
+    pgo) jq -e '.pgo_instrumented' "$output/build.json" >/dev/null ;;
+    bolt) test -x "$bolt"; jq -e '.pgo and (.pgo_instrumented | not)' "$output/build.json" >/dev/null ;;
+    *) exit 2 ;;
+esac
 case "$target" in
     x86_64|virt-x86_64)
         emulator=qemu-system-x86_64
@@ -26,8 +30,37 @@ case "$target" in
 esac
 
 workspace=$(mktemp -d "$(dirname "$resolved")/profile.XXXXXX")
-trap 'sudo rm -rf -- "$workspace"' EXIT
+trap 'rm -rf -- "$workspace"' EXIT
 mkdir -p "$profiles"
+
+kernel="$output/stage/boot/vmlinuz-uflinux-$target"
+if [[ "$machine" == virt ]]; then
+    gzip -dc "$kernel" > "$workspace/Image"
+    kernel="$workspace/Image"
+fi
+guest=("$emulator" -machine "$machine,accel=tcg" -cpu max -smp 1 -m 1536
+       -nographic -monitor none -no-reboot -nic none -kernel "$kernel" -initrd "$output/initramfs"
+       -drive "if=virtio,format=raw,snapshot=on,file=$output/boot-test.ext4")
+cmdline="nokaslr console=$serial root=/dev/vda rootfstype=ext4 rw init=/sbin/uflinux-profile panic=1"
+if [[ "$mode" == pgo ]]; then
+    symbols=$(nm "$output/vmlinux")
+    start=$(awk '$3 == "__uflinux_pgo_counters" {print $1}' <<< "$symbols")
+    end=$(awk '$3 == "__uflinux_pgo_counters_end" {print $1}' <<< "$symbols")
+    if [[ -z "$start" || -z "$end" ]]; then
+        echo "Missing instrumentation counters in the collection ELF" >&2
+        exit 1
+    fi
+    bytes=$(( 16#$end - 16#$start ))
+    test "$bytes" -gt 0
+    for snapshot in before after; do
+        rm -f "$output/pgo-$snapshot"
+        truncate -s "$(( (bytes + 511) / 512 * 512 ))" "$output/pgo-$snapshot"
+        guest+=(-drive "if=virtio,format=raw,file=$output/pgo-$snapshot")
+    done
+    timeout 600 "${guest[@]}" -append "$cmdline uflinux.pgo=1" 2>&1 | tee "$workspace/pgo.log"
+    grep -q '^UFLINUX_PROFILE_OK' "$workspace/pgo.log"
+    exit 0
+fi
 
 qemu_version=$("$emulator" -version | awk 'NR == 1 {print $4}')
 case "$qemu_version" in
@@ -52,100 +85,47 @@ read -ra glib_flags <<< "$(pkg-config --cflags --libs glib-2.0)"
 cc -O2 -Wall -Wextra -Werror -shared -fPIC -I"$workspace" \
     scripts/profile-tcg.c -o "$workspace/profile-tcg.so" "${glib_flags[@]}"
 
-for mode in autofdo bolt; do
-    output="$workspace/$mode"
-    mkdir -p "$output/profiles"
-    if [[ "$mode" == bolt ]]; then
-        cp "$profiles/kernel.afdo" "$profiles/autofdo.json" "$output/profiles/"
-    fi
-    UFLINUX_PROFILE_GUEST=1 scripts/container.sh "$target" "$resolved" "$output" --profile-build
-    grep -qx CONFIG_AUTOFDO_CLANG=y "$output/kernel.config"
-    if [[ "$mode" == bolt ]]; then
-        jq -e '.autofdo == true' "$output/build.json" >/dev/null
-    fi
+text_start=$(nm "$output/vmlinux" | awk '$3 == "_stext" {print $1}')
+text_end=$(nm "$output/vmlinux" | awk '$3 == "_etext" {print $1}')
+test -n "$text_start"
+test -n "$text_end"
+trace="$workspace/$mode.trace"
+marker="$workspace/$mode.start"
+# Use the ELF's addresses directly and collect only after guest setup.
+timeout 600 "${guest[@]}" \
+    -plugin "$workspace/profile-tcg.so,start=$text_start,end=$text_end,output=$trace,marker=$marker" \
+    -append "$cmdline" \
+    2>&1 | awk -v marker="$marker" '
+        { print; fflush() }
+        /^UFLINUX_PROFILE_START/ { print 1 > marker; close(marker) }
+    ' | tee "$workspace/$mode.log"
+grep -q '^UFLINUX_PROFILE_OK' "$workspace/$mode.log"
+grep -q '^F ' "$trace"
+grep -q '^B ' "$trace"
+LC_ALL=C sort "$trace" -o "$trace"
 
-    text_start=$(nm "$output/vmlinux" | awk '$3 == "_stext" {print $1}')
-    text_end=$(nm "$output/vmlinux" | awk '$3 == "_etext" {print $1}')
-    test -n "$text_start"
-    test -n "$text_end"
-    trace="$workspace/$mode.trace"
-    marker="$workspace/$mode.start"
-    kernel="$output/stage/boot/vmlinuz-uflinux-$target"
-    if [[ "$machine" == virt ]]; then
-        gzip -dc "$kernel" > "$workspace/Image"
-        kernel="$workspace/Image"
-    fi
-    # Use the ELF's addresses directly and collect only after guest setup.
-    timeout 600 "$emulator" -machine "$machine,accel=tcg" -cpu max \
-        -smp 1 -m 1536 -nographic -monitor none -no-reboot -nic none \
-        -plugin "$workspace/profile-tcg.so,start=$text_start,end=$text_end,output=$trace,marker=$marker" \
-        -kernel "$kernel" -initrd "$output/initramfs" \
-        -drive "if=virtio,format=raw,snapshot=on,file=$output/boot-test.ext4" \
-        -append "nokaslr console=$serial root=/dev/vda rootfstype=ext4 rw init=/sbin/uflinux-profile panic=1" \
-        2>&1 | awk -v marker="$marker" '
-            { print; fflush() }
-            /^UFLINUX_PROFILE_START/ { print 1 > marker; close(marker) }
-        ' | tee "$workspace/$mode.log"
-    grep -q '^UFLINUX_PROFILE_OK' "$workspace/$mode.log"
-    grep -q '^F ' "$trace"
-    grep -q '^B ' "$trace"
-    LC_ALL=C sort "$trace" -o "$trace"
-
-    manifest="$output/build.json"
-    if [[ "$mode" == autofdo ]]; then
-        profile="$profiles/kernel.afdo"
-        # LLVM's unsymbolized format stores counted ranges and branches separately.
-        awk '
-            $1 == "F" { ranges[++nr] = $2 "-" $3 ":" $4 }
-            $1 == "B" { branches[++nb] = $2 "->" $3 ":" $4 }
-            END {
-                print nr
-                for (i = 1; i <= nr; ++i) print ranges[i]
-                print nb
-                for (i = 1; i <= nb; ++i) print branches[i]
-            }
-        ' "$trace" > "$workspace/kernel.unsymbolized"
-        "$profgen" --kernel --use-offset=false --binary="$output/vmlinux" \
-            --unsymbolized-profile="$workspace/kernel.unsymbolized" -o "$profile"
-        "$profdata" merge --sample --text "$profile" -o "$workspace/kernel.afdo.txt"
-        grep -Eq '^[^[:space:]].*:[1-9][0-9]*:[0-9]+$' "$workspace/kernel.afdo.txt"
-        jq --arg sha256 "$(sha256sum "$profile" | cut -d' ' -f1)" \
-            '{source, config_sha256, sha256: $sha256}' "$manifest" > "$profiles/autofdo.json"
-        if [[ -z "$bolt" ]]; then
-            break
-        fi
-    else
-        profile="$profiles/kernel.fdata"
-        # The BOLT format also has a misprediction count for each branch.
-        awk '$1 == "B" {print $0 " 0"; next} {print}' "$trace" > "$workspace/kernel.preaggregated"
-        bolt_options=()
-        if [[ "$machine" == q35 ]]; then
-            bolt_options+=("--linux-bug-entry-size=$(jq -er '.bolt_bug_entry_size' "$manifest")")
-        fi
-        "$bolt" --aggregate-only --pa --relocs=0 "${bolt_options[@]}" \
-            -p "$workspace/kernel.preaggregated" -o "$workspace/kernel.fdata" "$output/vmlinux" \
-            2>&1 | tee "$workspace/bolt-conversion.log"
-        grep -Fxq 'BOLT-INFO: Linux kernel binary detected' "$workspace/bolt-conversion.log"
-        test -s "$workspace/kernel.fdata"
-        mv "$workspace/kernel.fdata" "$profile"
-        build_id=$(readelf -n "$output/vmlinux" | awk '/Build ID:/ {print $3; exit}')
-        test -n "$build_id"
-        jq --arg sha256 "$(sha256sum "$profile" | cut -d' ' -f1)" --arg build_id "$build_id" \
-            --arg input_sha256 "$(sha256sum "$output/vmlinux" | cut -d' ' -f1)" \
-            --arg rewriter_sha256 "$(sha256sum "$(command -v "$bolt")" | cut -d' ' -f1)" \
-            '{source, build_id: $build_id, input_sha256: $input_sha256, sha256: $sha256, rewriter_sha256: $rewriter_sha256}' \
-            "$manifest" > "$profiles/bolt.json"
-        if [[ -n "$release_output" ]]; then
-            cp "$profile" "$profiles/bolt.json" "$output/profiles/"
-            cp -a "$profiles/bolt" "$output/bolt"
-            UFLINUX_PROFILE_GUEST='' scripts/container.sh "$target" "$resolved" "$output" --apply-collected-bolt
-            jq -e '.autofdo and .bolt' "$manifest" >/dev/null
-            scripts/boot-test.sh "$target" "$output"
-            mkdir -p "$release_output"
-            cp "$output/"*.apk "$output/"*.ec.pem.pub "$output/apk-zstd" \
-                "$output/source-apk-zstd.tar.gz" "$output/source-$target.tar.zst" \
-                "$manifest" "$output/kernel.config" "$output/boot-test.log" "$release_output/"
-        fi
-    fi
-    sudo rm -rf -- "$output"
-done
+manifest="$output/build.json"
+profile="$profiles/kernel.fdata"
+# The BOLT format also has a misprediction count for each branch.
+awk '$1 == "B" {print $0 " 0"; next} {print}' "$trace" > "$workspace/kernel.preaggregated"
+bolt_options=()
+if [[ "$machine" == q35 ]]; then
+    bolt_options+=("--linux-bug-entry-size=$(jq -er '.bolt_bug_entry_size' "$manifest")")
+fi
+"$bolt" --aggregate-only --pa --relocs=0 "${bolt_options[@]}" \
+    -p "$workspace/kernel.preaggregated" -o "$workspace/kernel.fdata" "$output/vmlinux" \
+    2>&1 | tee "$workspace/bolt-conversion.log"
+grep -Fxq 'BOLT-INFO: Linux kernel binary detected' "$workspace/bolt-conversion.log"
+test -s "$workspace/kernel.fdata"
+mv "$workspace/kernel.fdata" "$profile"
+build_id=$(readelf -n "$output/vmlinux" | awk '/Build ID:/ {print $3; exit}')
+test -n "$build_id"
+rewriter=$bolt
+if [[ -f "${bolt%/*}/lib/optimizer" ]]; then
+    rewriter="${bolt%/*}/lib/optimizer"
+fi
+jq --arg sha256 "$(sha256sum "$profile" | cut -d' ' -f1)" --arg build_id "$build_id" \
+    --arg input_sha256 "$(sha256sum "$output/vmlinux" | cut -d' ' -f1)" \
+    --arg rewriter_sha256 "$(sha256sum "$rewriter" | cut -d' ' -f1)" \
+    '{source, build_id: $build_id, input_sha256: $input_sha256, sha256: $sha256, rewriter_sha256: $rewriter_sha256}' \
+    "$manifest" > "$profiles/bolt.json"
