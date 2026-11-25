@@ -122,10 +122,15 @@ if [[ "$phase" != package ]]; then
         export PATH="/out/bolt:/opt/llvm-bin:$PATH"
         if [ -d /out/profiles ]; then export UFLINUX_PROFILE_DIR=/out/profiles; fi
         if [ "$phase" = merge-pgo ]; then
-            exec python3 /builder/scripts/kernel_pgo.py /out /out/profiles llvm-profdata
+            python3 /builder/scripts/kernel_pgo.py /out /out/profiles llvm-profdata
+            chmod -R a+rX /out
+            exit 0
         fi
         if [ -n "$profile" ]; then set -- "$profile"; else set --; fi
         python3 /builder/scripts/build.py "$target" /out/resolved.json /out "$@"
+        # Kbuild creates root-only intermediates (initramfs_data.cpio, signing_key.pem).
+        # The host packs this tree as an unprivileged user, so make it world readable.
+        chmod -R a+rX /out
         ' sh "$major" "$target" "$profile" "$phase" "${package_args[@]}"
 
 fi
