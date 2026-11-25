@@ -30,7 +30,7 @@ The generic kernels keep Alpine's CPU baselines. Optimizations use Clang, ThinLT
 
 ### UFlinux profiles
 
-Scheduled releases use the ordinary build path. To generate profiles for a full release, dispatch the workflow on the default branch with `profile_target=none` and `generate_release_profiles=true`. The workflow independently profiles `x86_64`, `virt-x86_64`, `aarch64`, and `virt-aarch64` using mixed block I/O and loopback TCP in QEMU. Clang instrumentation covers selected built-in block, memory, filesystem, and networking code. The optimized kernel consumes the resulting instrumentation profile without including the counter exporter.
+Scheduled releases generate PGO profiles and apply BOLT wherever the release workflow has a compatible rewriter. Scheduled runs skip inputs that already have a published release. To run the same pipeline manually, dispatch the workflow on the default branch with `profile_target=none` and `generate_release_profiles=true`. The workflow independently profiles `x86_64`, `virt-x86_64`, `aarch64`, and `virt-aarch64` using mixed block I/O and loopback TCP in QEMU. Clang instrumentation covers selected built-in block, memory, filesystem, and networking code. The optimized kernel consumes the resulting instrumentation profile without including the counter exporter.
 
 To collect a profile locally for a generic or virtual target, use matching Alpine build dependencies in both builds:
 
@@ -52,7 +52,7 @@ For BOLT, use the exact linked ELF from the PGO-optimized build. CI separates th
 
 To build the x86 rewriter locally, resolve with `--generate-profiles`, install the x86_64 LLVM versions listed in `work/resolved.json`, and run `scripts/build-kernel-bolt.sh <tools> work/resolved.json`. Bundle that binary using `UFLINUX_BOLT_BINARY` with `scripts/prepare-bolt.sh <target> <output> --bundle`. For a local training run, place the PGO profile pair in a fresh output directory under `profiles/`, then run `container.sh` with `--bolt-baseline` and `UFLINUX_PROFILE_GUEST=1`. Run `collect-release-profiles.sh <resolved> <output>/profiles <target> bolt <output> <output>/bolt/llvm-bolt`, then run `container.sh` with `--apply-collected-bolt` against that same output. Boot-test the rewritten package with `scripts/boot-test.sh`.
 
-In the opt-in profiling workflow, ARM64 uses PGO. Set `KERNEL_AARCH64_BOLT_RUNNER` to an Ubuntu 26.04 ARM64 runner with a compatible `llvm-bolt` on PATH to add BOLT. Its rewriter must support pre-aggregated traces and in-place kernel optimization. [LLVM AArch64 kernel BOLT proposal](https://github.com/llvm/llvm-project/pull/118022)
+Profiled ARM64 releases use PGO. Set `KERNEL_AARCH64_BOLT_RUNNER` to an Ubuntu 26.04 ARM64 runner with a compatible `llvm-bolt` on PATH to add BOLT. Its rewriter must support pre-aggregated traces and in-place kernel optimization. [LLVM AArch64 kernel BOLT proposal](https://github.com/llvm/llvm-project/pull/118022)
 
 ## Publish and install
 

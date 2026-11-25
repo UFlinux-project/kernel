@@ -36,6 +36,7 @@ jobs:
       bolt_matrix: ${{ steps.sources.outputs.bolt_matrix }}
       fingerprint: ${{ steps.sources.outputs.fingerprint }}
       build: ${{ steps.sources.outputs.build }}
+      generate_profiles: ${{ steps.sources.outputs.generate_profiles }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -45,7 +46,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PROFILE_TARGET: ${{ inputs.profile_target || 'none' }}
-          GENERATE_PROFILES: ${{ inputs.generate_release_profiles }}
+          GENERATE_PROFILES: ${{ (github.event_name == 'schedule' || inputs.generate_release_profiles) }}
           ARM_BOLT: ${{ vars.KERNEL_AARCH64_BOLT_RUNNER }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -65,13 +66,17 @@ jobs:
           bolt_matrix=$(jq -c --arg arm "$ARM_BOLT" '{include:[.include[]|select(.builder == "x86_64" or $arm != "")]}' <<< "$profile_matrix")
           source_hash=$(jq -r .fingerprint work/resolved.json)
           recipe_hash=$(git ls-tree -r HEAD -- scripts patches profiles targets.json .github/workflows/kernels.yml | sha256sum | cut -d' ' -f1)
-          fingerprint=$(printf '%s\n%s\n' "$source_hash" "$recipe_hash" | sha256sum | cut -d' ' -f1)
+          bolt_policy=
+          if [[ "$GENERATE_PROFILES" == true ]]; then
+            bolt_policy=$bolt_matrix
+          fi
+          fingerprint=$(printf '%s\n' "$source_hash" "$recipe_hash" "$GENERATE_PROFILES" "$bolt_policy" | sha256sum | cut -d' ' -f1)
           tag="kernels-${fingerprint:0:24}"
           build=true
           if [[ "$GITHUB_EVENT_NAME" == schedule ]] && gh release view "$tag" --json isDraft --jq '.isDraft' | grep -qx false; then
             build=false
           fi
-          printf 'matrix=%s\nprofile_matrix=%s\nbolt_matrix=%s\nfingerprint=%s\nbuild=%s\n' "$matrix" "$profile_matrix" "$bolt_matrix" "$fingerprint" "$build" >> "$GITHUB_OUTPUT"
+          printf 'matrix=%s\nprofile_matrix=%s\nbolt_matrix=%s\nfingerprint=%s\nbuild=%s\ngenerate_profiles=%s\n' "$matrix" "$profile_matrix" "$bolt_matrix" "$fingerprint" "$build" "$GENERATE_PROFILES" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         with:
           name: resolved-inputs
@@ -81,7 +86,7 @@ jobs:
 
   kernel-builders:
     needs: resolve
-    if: needs.resolve.outputs.build == 'true' && inputs.generate_release_profiles
+    if: needs.resolve.outputs.build == 'true' && needs.resolve.outputs.generate_profiles == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -116,7 +121,7 @@ jobs:
 
   bolt-tool:
     needs: resolve
-    if: needs.resolve.outputs.build == 'true' && inputs.generate_release_profiles
+    if: needs.resolve.outputs.build == 'true' && needs.resolve.outputs.generate_profiles == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
@@ -160,7 +165,7 @@ jobs:
 
   profile-compile:
     needs: [resolve, kernel-builders]
-    if: needs.resolve.outputs.build == 'true' && inputs.generate_release_profiles
+    if: needs.resolve.outputs.build == 'true' && needs.resolve.outputs.generate_profiles == 'true'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.profile_matrix) }}
@@ -241,7 +246,7 @@ jobs:
 
   compile:
     needs: [resolve, kernel-builders, profile-collect]
-    if: ${{ !cancelled() && needs.resolve.outputs.build == 'true' && (needs.profile-collect.result == 'success' || (!inputs.generate_release_profiles && needs.profile-collect.result == 'skipped')) }}
+    if: ${{ !cancelled() && needs.resolve.outputs.build == 'true' && (needs.profile-collect.result == 'success' || (needs.resolve.outputs.generate_profiles != 'true' && needs.profile-collect.result == 'skipped')) }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
@@ -254,8 +259,8 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       PROFILE_TARGET: ${{ inputs.profile_target || 'none' }}
-      REQUIRE_PROFILE: ${{ matrix.profile && inputs.generate_release_profiles }}
-      BOLT_RELEASE: ${{ matrix.profile && inputs.generate_release_profiles && (matrix.builder == 'x86_64' || vars.KERNEL_AARCH64_BOLT_RUNNER != '') }}
+      REQUIRE_PROFILE: ${{ matrix.profile && needs.resolve.outputs.generate_profiles == 'true' }}
+      BOLT_RELEASE: ${{ matrix.profile && needs.resolve.outputs.generate_profiles == 'true' && (matrix.builder == 'x86_64' || vars.KERNEL_AARCH64_BOLT_RUNNER != '') }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -265,7 +270,7 @@ jobs:
           name: resolved-inputs
           path: work
       - uses: actions/download-artifact@v8
-        if: inputs.generate_release_profiles
+        if: needs.resolve.outputs.generate_profiles == 'true'
         with:
           name: alpine-build-deps-${{ matrix.builder }}
           path: work/kernel-packages
@@ -313,7 +318,7 @@ jobs:
 
   bolt:
     needs: [resolve, compile, bolt-tool]
-    if: inputs.generate_release_profiles
+    if: needs.resolve.outputs.generate_profiles == 'true'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.bolt_matrix) }}
@@ -386,7 +391,7 @@ jobs:
 
   build:
     needs: [resolve, compile, bolt]
-    if: ${{ !cancelled() && needs.compile.result == 'success' && (needs.bolt.result == 'success' || (!inputs.generate_release_profiles && needs.bolt.result == 'skipped')) }}
+    if: ${{ !cancelled() && needs.compile.result == 'success' && (needs.bolt.result == 'success' || (needs.resolve.outputs.generate_profiles != 'true' && needs.bolt.result == 'skipped')) }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
@@ -396,7 +401,7 @@ jobs:
       TARGET: ${{ matrix.target }}
       PROFILE_TARGET: ${{ inputs.profile_target || 'none' }}
       UFLINUX_PKGREL: ${{ github.run_number }}
-      BOLT_RELEASE: ${{ matrix.profile && inputs.generate_release_profiles && (matrix.builder == 'x86_64' || vars.KERNEL_AARCH64_BOLT_RUNNER != '') }}
+      BOLT_RELEASE: ${{ matrix.profile && needs.resolve.outputs.generate_profiles == 'true' && (matrix.builder == 'x86_64' || vars.KERNEL_AARCH64_BOLT_RUNNER != '') }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -530,7 +535,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       FINGERPRINT: ${{ needs.resolve.outputs.fingerprint }}
-      GENERATED_PROFILES: ${{ inputs.generate_release_profiles }}
+      GENERATED_PROFILES: ${{ needs.resolve.outputs.generate_profiles == 'true' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -546,7 +551,7 @@ jobs:
           name: resolved-inputs
           path: work
       - uses: actions/download-artifact@v8
-        if: inputs.generate_release_profiles
+        if: needs.resolve.outputs.generate_profiles == 'true'
         with:
           pattern: "*-profile-*"
           path: work/release-profiles
@@ -566,8 +571,7 @@ jobs:
           cp work/resolved.json dist/
           if [[ "$GENERATED_PROFILES" == true ]]; then
             PROFILE_FINGERPRINT=$(cd work/release-profiles && sha256sum -- */*.json */kernel.* | sha256sum | cut -d' ' -f1)
-            FINGERPRINT=$(printf '%s\n%s\n' "$FINGERPRINT" "$PROFILE_FINGERPRINT" | sha256sum | cut -d' ' -f1)
-            printf 'FINGERPRINT=%s\n' "$FINGERPRINT" >> "$GITHUB_ENV"
+            printf '%s\n' "$PROFILE_FINGERPRINT" > dist/profile-fingerprint.txt
           fi
           printf '%s\n' "$FINGERPRINT" > dist/input-fingerprint.txt
           source scripts/container.sh
