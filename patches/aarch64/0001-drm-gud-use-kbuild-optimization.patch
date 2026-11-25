@@ -1,0 +1,11 @@
+diff --git a/drivers/gpu/drm/gud/Makefile b/drivers/gpu/drm/gud/Makefile
+--- a/drivers/gpu/drm/gud/Makefile
++++ b/drivers/gpu/drm/gud/Makefile
+@@ -1,4 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
++# Generic ARM64 fails the fortified-read check when linking GUD with -O3.
++ccflags-remove-y		+= -O3
++
+ gud-y				:= gud_drv.o gud_pipe.o gud_connector.o
+ obj-$(CONFIG_DRM_GUD)		+= gud.o

@@ -26,7 +26,7 @@ Use a fresh output directory when repeating a build. Run `python3 scripts/resolv
 
 Place target patches under `patches/<target>/` using numbered `.patch` filenames. Required local and vendor patches apply in order before BBRv3, BORE, and le9uo. BBRv3 is required and is built in as the default TCP congestion control. MGLRU is enabled at boot where the final Kconfig supports it. BORE and le9uo are used when the kernel series has a patch that applies cleanly. Inspect `build-<target>.json` in the release for patch hashes, feature status, and omitted optimizations.
 
-The generic kernels keep Alpine's CPU baselines. Optimizations use Clang, ThinLTO in distributed mode where supported, and `-O3` when the kernel compiles with it. The BOLT integration uses the exact linked binary and runs before the boot image is generated.
+The generic kernels keep Alpine's CPU baselines. Optimizations use Clang, ThinLTO in distributed mode where supported, and `-O3` when the kernel compiles with it. On generic `aarch64`, GUD uses Kbuild’s optimization level because its module link failed Clang’s fortified-read check at `-O3`. The BOLT integration uses the exact linked binary and runs before the boot image is generated.
 
 ### UFlinux profiles
 
