@@ -50,13 +50,12 @@ jobs:
             echo "::error::Profile generation requires a full release build on the default branch"
             exit 1
           fi
-          if [[ "$PROFILE_TARGET" == none ]]; then
-            python3 scripts/resolve.py
-          else
-            python3 scripts/resolve.py --target "$PROFILE_TARGET"
-          fi
+          args=()
+          [[ "$PROFILE_TARGET" == none ]] || args+=(--target "$PROFILE_TARGET")
+          [[ "$GENERATE_PROFILES" != true ]] || args+=(--generate-profiles)
+          python3 scripts/resolve.py "${args[@]}"
           matrix=$(jq -c '{include:[.targets|to_entries[]|{
-            target:.key,runner:.value.runner,
+            target:.key,runner:.value.runner,builder:.value.builder,
             profile:(.value.source == "stable" and (.value.apk == "x86_64" or .value.apk == "aarch64"))
           }]}' work/resolved.json)
           profile_matrix=$(jq -c '{include:[.include[]|select(.profile)]}' <<< "$matrix")
@@ -74,9 +73,44 @@ jobs:
           name: resolved-inputs
           path: work/resolved.json
           if-no-files-found: error
+          overwrite: true
+
+  kernel-builders:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true' && inputs.generate_release_profiles
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-26.04
+          - arch: aarch64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: resolved-inputs
+          path: work
+      - name: Snapshot Alpine kernel build dependencies
+        env:
+          BUILDER_ARCH: ${{ matrix.arch }}
+        run: |
+          source scripts/container.sh
+          fetch_kernel_packages work/resolved.json "$BUILDER_ARCH" work/kernel-packages
+      - uses: actions/upload-artifact@v7
+        with:
+          name: alpine-build-deps-${{ matrix.arch }}
+          path: work/kernel-packages/*.apk
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
 
   profile-release:
-    needs: resolve
+    needs: [resolve, kernel-builders]
     if: needs.resolve.outputs.build == 'true' && inputs.generate_release_profiles
     strategy:
       fail-fast: false
@@ -89,6 +123,7 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       UFLINUX_PKGREL: ${{ github.run_number }}
+      UFLINUX_KERNEL_PACKAGES: work/kernel-packages
     steps:
       - uses: actions/checkout@v7
         with:
@@ -97,21 +132,31 @@ jobs:
         with:
           name: resolved-inputs
           path: work
+      - uses: actions/download-artifact@v8
+        with:
+          name: alpine-build-deps-${{ matrix.builder }}
+          path: work/kernel-packages
       - name: Install profiling tools
+        env:
+          BUILDER_ARCH: ${{ matrix.builder }}
         run: |
           major=$(jq -er '.llvm.major' work/resolved.json)
-          packages=(qemu-system-x86 cmake ninja-build "llvm-$major-dev" "clang-$major" g++ libzstd-dev zlib1g-dev)
+          packages=(qemu-system-x86 cmake ninja-build g++ libzstd-dev zlib1g-dev)
           if [[ "$TARGET" == *aarch64 ]]; then
             packages=(qemu-system-arm)
           fi
-          # Ubuntu ships an older LLVM; the toolchain must match the resolved release.
-          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
+          codename=$(jq -er '.llvm.apt_codename' work/resolved.json)
+          test "$codename" = "$(. /etc/os-release && echo "$VERSION_CODENAME")"
+          llvm_pins=$(jq -er --arg arch "$BUILDER_ARCH" '
+            .llvm.apt_packages[$arch] | to_entries[] | "\(.key)=\(.value)"
+          ' work/resolved.json)
+          mapfile -t llvm_packages <<< "$llvm_pins"
+          curl -fsSL --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key |
               sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
           echo "deb https://apt.llvm.org/$codename llvm-toolchain-$codename-$major main" |
-              sudo tee /etc/apt/sources.list.d/llvm-$major.list > /dev/null
+              sudo tee "/etc/apt/sources.list.d/llvm-$major.list" > /dev/null
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends "${packages[@]}" gcc pkg-config libglib2.0-dev "llvm-$major"
+          sudo apt-get install -y --no-install-recommends "${packages[@]}" "${llvm_packages[@]}" gcc pkg-config libglib2.0-dev
       - name: Collect AutoFDO and BOLT profiles with QEMU TCG
         env:
           AARCH64_BOLT_RUNNER: ${{ vars.KERNEL_AARCH64_BOLT_RUNNER }}
@@ -196,13 +241,22 @@ jobs:
         with:
           name: release-profiles-${{ matrix.target }}
           path: work/${{ matrix.target }}/profiles
+      - uses: actions/download-artifact@v8
+        if: inputs.generate_release_profiles
+        with:
+          name: alpine-build-deps-${{ matrix.builder }}
+          path: work/kernel-packages
       - name: Build and install-test APK
         env:
           GENERATED_PROFILES: ${{ matrix.profile && inputs.generate_release_profiles }}
+          RELEASE_PROFILES: ${{ inputs.generate_release_profiles }}
           AARCH64_BOLT_RUNNER: ${{ vars.KERNEL_AARCH64_BOLT_RUNNER }}
         run: |
           args=()
           require_bolt=false
+          if [[ "$RELEASE_PROFILES" == true ]]; then
+            export UFLINUX_KERNEL_PACKAGES=work/kernel-packages
+          fi
           if [[ "$GENERATED_PROFILES" == true && ( "$TARGET" == *x86_64 || -n "$AARCH64_BOLT_RUNNER" ) ]]; then
             require_bolt=true
           fi
@@ -262,6 +316,7 @@ jobs:
           path: dist
           if-no-files-found: error
           compression-level: 0
+          overwrite: true
       - uses: actions/upload-artifact@v7
         if: inputs.profile_target == 'none' || inputs.profile_target == ''
         with:
@@ -272,6 +327,7 @@ jobs:
             work/${{ matrix.target }}/apk-zstd
           if-no-files-found: error
           compression-level: 0
+          overwrite: true
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -279,6 +335,7 @@ jobs:
           path: |
             work/${{ matrix.target }}/kernel.config
             work/${{ matrix.target }}/boot-test.log
+          overwrite: true
 
   coexist:
     needs: [resolve, build]
@@ -416,5 +473,18 @@ jobs:
             gh release create "$tag" --draft --target "$GITHUB_SHA" --title "UFlinux kernels ${FINGERPRINT:0:12}" \
               --notes "Signed Alpine kernel APKs. See the build manifests and SHA256SUMS."
           fi
+          expected=$(find dist -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+          existing=$(gh release view "$tag" --json assets --jq '.assets[].name')
+          while IFS= read -r asset; do
+            if [[ -n "$asset" && ! -f "dist/$asset" ]]; then
+              gh release delete-asset "$tag" "$asset" --yes
+            fi
+          done <<< "$existing"
           gh release upload "$tag" dist/* --clobber
+          actual=$(gh release view "$tag" --json assets --jq '.assets[].name' | LC_ALL=C sort)
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::The uploaded release assets differ from the local release files"
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
           gh release edit "$tag" --draft=false

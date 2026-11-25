@@ -84,6 +84,7 @@ poweroff -f
 script = script.replace("@ABI@", meta["abi"]).replace("@BBR@", meta["bbrv3"])
 script = script.replace("@MGLRU@", 'test "$(( $(cat /sys/kernel/mm/lru_gen/enabled) & 1 ))" = 1' if meta["mglru"] else ':')
 script = script.replace("@LE9UO@", """test -r /proc/sys/vm/workingset_protection
+mount -o remount,rw /
 mount -t cgroup2 none /sys/fs/cgroup
 echo +memory >/sys/fs/cgroup/cgroup.subtree_control
 mkdir -p /sys/fs/cgroup/reclaim

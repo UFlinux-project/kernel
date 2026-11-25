@@ -2,13 +2,16 @@
 """Resolve moving upstream inputs once for the entire release matrix."""
 
 import argparse
+import gzip
 import hashlib
+import http.client
+import io
 import json
 import os
-import io
-import tarfile
 from pathlib import Path
 import re
+import tarfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,6 +21,7 @@ ALPINE = "https://dl-cdn.alpinelinux.org/alpine"
 API = "https://api.github.com"
 RAW = "https://raw.githubusercontent.com"
 PLATFORMS = {"x86_64": "amd64", "aarch64": "arm64", "riscv64": "riscv64"}
+LLVM_APT_CODENAME = "resolute"
 
 
 def fetch(url, *, missing=False):
@@ -32,8 +36,12 @@ def fetch(url, *, missing=False):
         except urllib.error.HTTPError as error:
             if missing and error.code == 404:
                 return None
-            if error.code not in (429, 500, 502, 503, 504) or attempt == 2:
+            if error.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
                 raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead):
+            if attempt == 2:
+                raise
+        time.sleep(2 ** attempt)
 
 
 def github(path, *, missing=False):
@@ -151,8 +159,26 @@ def toolchain(alpine, arch):
     return {"major": major, "versions": packages}
 
 
+def llvm_apt_packages(major, arch):
+    codename = LLVM_APT_CODENAME
+    index = fetch(f"https://apt.llvm.org/{codename}/dists/llvm-toolchain-{codename}-{major}"
+                  f"/main/binary-{PLATFORMS[arch]}/Packages.gz", missing=True)
+    if index is None:
+        return {}
+    required = {f"llvm-{major}"}
+    if arch == "x86_64":
+        required.update((f"llvm-{major}-dev", f"clang-{major}"))
+    packages = {}
+    for block in gzip.decompress(index).decode().split("\n\n"):
+        name = re.search(r"^Package: (.+)$", block, re.M)
+        if name and name[1] in required:
+            version = re.search(r"^Version: (.+)$", block, re.M)
+            packages[name[1]] = version[1]
+    return packages if packages.keys() == required else {}
+
+
 def llvm():
-    """Latest stable LLVM release used to build the BOLT kernel rewriter."""
+    """Select the newest stable LLVM source that matches the Ubuntu profiling SDK."""
     releases = github("llvm/llvm-project/releases?per_page=30")
     stable = {}
     for release in releases:
@@ -160,16 +186,26 @@ def llvm():
         if not match or release["prerelease"] or release["draft"]:
             continue
         stable[tuple(int(part) for part in match.groups())] = release
-    if not stable:
-        raise ValueError("No stable LLVM release found")
-    numbers, release = max(stable.items())
-    version = ".".join(str(part) for part in numbers)
-    archive = f"llvm-project-{version}.src.tar.xz"
-    digests = {asset["name"]: asset.get("digest", "") for asset in release["assets"]}
-    if not digests.get(archive, "").startswith("sha256:"):
-        raise ValueError(f"LLVM {version} source archive has no published checksum")
-    return {"version": version, "major": numbers[0], "archive": archive,
-            "sha256": digests[archive].split(":", 1)[1]}
+    for major in sorted({numbers[0] for numbers in stable}, reverse=True):
+        apt = {arch: llvm_apt_packages(major, arch) for arch in ("x86_64", "aarch64")}
+        if not all(packages and len(set(packages.values())) == 1 for packages in apt.values()):
+            continue
+        upstream_versions = {
+            match[1] if (match := re.match(r"(?:\d+:)?(\d+\.\d+\.\d+)(?=[~+\-]|$)", version)) else None
+            for packages in apt.values() for version in packages.values()
+        }
+        if len(upstream_versions) != 1 or None in upstream_versions:
+            continue
+        version = upstream_versions.pop()
+        release = stable.get(tuple(map(int, version.split("."))))
+        if release is None:
+            continue
+        archive = f"llvm-project-{version}.src.tar.xz"
+        digest = next((asset.get("digest") for asset in release["assets"] if asset["name"] == archive), None)
+        if digest and re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            return {"version": version, "major": major, "archive": archive, "sha256": digest[7:],
+                    "apt_codename": LLVM_APT_CODENAME, "apt_packages": apt}
+    raise ValueError("No published stable LLVM source matches the Ubuntu profiling packages")
 
 
 def topic_patch(series):
@@ -195,7 +231,7 @@ def candidates(repo, ref, paths, pattern, series, *, previous=0):
     return [raw(repo, ref, path) for _, path in sorted(matches, reverse=True)]
 
 
-def resolve(selected=None):
+def resolve(selected=None, *, generate_profiles=False):
     targets = json.loads((ROOT / "targets.json").read_text())
     if selected:
         targets = {selected: targets[selected]}
@@ -236,16 +272,20 @@ def resolve(selected=None):
             target["config_url"] = raw("alpinelinux/aports", aports, f"main/linux-lts/{target['config']}")
         target["alpine"] = alpine[target["apk"]]
         target["builder"] = "aarch64" if target["arch"] == "arm64" else "x86_64"
-    return {"targets": targets, "alpine": alpine, "aports": aports, "llvm": llvm(),
-            "toolchains": {arch: toolchain(alpine[arch], arch) for arch in ("x86_64", "aarch64")}}
+    result = {"targets": targets, "alpine": alpine, "aports": aports,
+              "toolchains": {arch: toolchain(alpine[arch], arch) for arch in ("x86_64", "aarch64")}}
+    if generate_profiles:
+        result["llvm"] = llvm()
+    return result
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--target")
+    parser.add_argument("--generate-profiles", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("work/resolved.json"))
     args = parser.parse_args()
-    result = resolve(args.target)
+    result = resolve(args.target, generate_profiles=args.generate_profiles)
     canonical = json.dumps(result, sort_keys=True).encode()
     result["fingerprint"] = hashlib.sha256(canonical).hexdigest()
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -90,7 +90,7 @@ def enable_arm64_autofdo(kernel):
     opt_in = "\tselect ARCH_SUPPORTS_AUTOFDO_CLANG\n"
     if opt_in not in text:
         marker = "\tselect ARCH_SUPPORTS_LTO_CLANG_THIN\n"
-        if text.count(marker) != 1 or "mksysmap()" not in text:
+        if text.count(marker) != 1:
             raise SystemExit("ARM64 AutoFDO Kconfig layout changed")
         kconfig.write_text(text.replace(marker, marker + opt_in))
 
@@ -186,7 +186,7 @@ def bolt_hook(kernel, x86):
     script = kernel / "scripts/link-vmlinux.sh"
     text = script.read_text()
     marker = "# For fixdep"
-    if text.count(marker) != 1:
+    if text.count(marker) != 1 or "mksysmap()" not in text:
         return False
     if x86:
         recipe = kernel / "arch/x86/boot/compressed/Makefile"
