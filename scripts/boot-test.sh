@@ -6,13 +6,17 @@ output=${2:?Specify the output directory}
 test -f "$output/boot-test.ext4" || exit 0
 
 kernel="$output/stage/boot/vmlinuz-uflinux-$target"
+
+# shellcheck source=scripts/kernel-image.sh
+. "$(dirname "$0")/kernel-image.sh"
+
 case "$target" in
     aarch64|virt-aarch64)
         emulator=qemu-system-aarch64
         machine=virt
         cpu=cortex-a57
         serial=ttyAMA0
-        gzip -dc "$kernel" >"$output/boot-test.Image"
+        decompress_kernel "$kernel" >"$output/boot-test.Image"
         kernel="$output/boot-test.Image"
         ;;
     *)

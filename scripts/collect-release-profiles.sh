@@ -34,8 +34,10 @@ trap 'rm -rf -- "$workspace"' EXIT
 mkdir -p "$profiles"
 
 kernel="$output/stage/boot/vmlinuz-uflinux-$target"
+# shellcheck source=scripts/kernel-image.sh
+. "$(dirname "$0")/kernel-image.sh"
 if [[ "$machine" == virt ]]; then
-    gzip -dc "$kernel" > "$workspace/Image"
+    decompress_kernel "$kernel" > "$workspace/Image"
     kernel="$workspace/Image"
 fi
 guest=("$emulator" -machine "$machine,accel=tcg" -cpu max -smp 1 -m 1536

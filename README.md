@@ -22,7 +22,7 @@ scripts/container.sh virt-x86_64 work/resolved.json work/virt-x86_64
 scripts/boot-test.sh virt-x86_64 work/virt-x86_64
 ```
 
-Use a fresh output directory when repeating a build. Run `python3 scripts/resolve.py` to resolve the entire matrix. For source and patch validation without compilation, run `python3 scripts/build.py virt-x86_64 work/resolved.json work/patch-check --prepare-only`. A GitHub token in `GH_TOKEN` can raise the source resolver's API rate limit.
+Use a fresh output directory when repeating a build. Run `python3 scripts/resolve.py` to resolve the entire matrix. For source and patch validation without compilation, run `python3 scripts/build.py virt-x86_64 work/resolved.json work/patch-check --prepare-only`. A GitHub token in `GH_TOKEN` can raise the source resolver's API rate limit. A local build that ships signed modules exports `UFLINUX_MODULE_SIGNING_KEY` (base64-encoded combined key-and-certificate PEM) or `UFLINUX_MODULE_SIGNING_KEY_FILE`; without one, a flavor that requests signing warns and builds unsigned.
 
 Place target patches under `patches/<target>/` using numbered `.patch` filenames. Required local and vendor patches apply in order before BBRv3, BORE, and le9uo. BBRv3 is required and is built in as the default TCP congestion control. MGLRU is enabled at boot where the final Kconfig supports it. BORE and le9uo are used when the kernel series has a patch that applies cleanly. Inspect `build-<target>.json` in the release for patch hashes, feature status, and omitted optimizations.
 
@@ -30,7 +30,7 @@ The generic kernels keep Alpine's CPU baselines. Optimizations use Clang, ThinLT
 
 ### UFlinux profiles
 
-Scheduled releases generate PGO profiles and apply BOLT wherever the release workflow has a compatible rewriter. Scheduled runs skip inputs that already have a published release. To run the same pipeline manually, dispatch the workflow on the default branch with `profile_target=none` and `generate_release_profiles=true`. The workflow independently profiles `x86_64`, `virt-x86_64`, `aarch64`, and `virt-aarch64` using mixed block I/O and loopback TCP in QEMU. Clang instrumentation covers selected built-in block, memory, filesystem, and networking code. The optimized kernel consumes the resulting instrumentation profile without including the counter exporter.
+Scheduled releases generate PGO profiles and apply BOLT wherever the release workflow has a compatible rewriter. Scheduled runs skip inputs that already have a published release. To run the same pipeline manually, dispatch the workflow on the default branch with `profile_target=none` and `generate_release_profiles=true`. A manual run that skips profile generation publishes anyway when `force_publish=true`: it ships the default-optimization kernels built without PGO or BOLT, under the same tag as an otherwise identical profile-less build. Force publish needs a full release build, so it cannot be combined with `profile_target`. The workflow independently profiles `x86_64`, `virt-x86_64`, `aarch64`, and `virt-aarch64` using mixed block I/O and loopback TCP in QEMU. Clang instrumentation covers selected built-in block, memory, filesystem, and networking code. The optimized kernel consumes the resulting instrumentation profile without including the counter exporter.
 
 To collect a profile locally for a generic or virtual target, use matching Alpine build dependencies in both builds:
 
@@ -53,6 +53,28 @@ For BOLT, use the exact linked ELF from the PGO-optimized build. CI separates th
 To build the x86 rewriter locally, resolve with `--generate-profiles`, install the x86_64 LLVM versions listed in `work/resolved.json`, and run `scripts/build-kernel-bolt.sh <tools> work/resolved.json`. Bundle that binary using `UFLINUX_BOLT_BINARY` with `scripts/prepare-bolt.sh <target> <output> --bundle`. For a local training run, place the PGO profile pair in a fresh output directory under `profiles/`, then run `container.sh` with `--bolt-baseline` and `UFLINUX_PROFILE_GUEST=1`. Run `collect-release-profiles.sh <resolved> <output>/profiles <target> bolt <output> <output>/bolt/llvm-bolt`, then run `container.sh` with `--apply-collected-bolt` against that same output. Boot-test the rewritten package with `scripts/boot-test.sh`.
 
 Profiled ARM64 releases use PGO. Set `KERNEL_AARCH64_BOLT_RUNNER` to an Ubuntu 26.04 ARM64 runner with a compatible `llvm-bolt` on PATH to add BOLT. Its rewriter must support pre-aggregated traces and in-place kernel optimization. [LLVM AArch64 kernel BOLT proposal](https://github.com/llvm/llvm-project/pull/118022)
+
+## Memory footprint policy
+
+The measured baseline for `virt-x86_64` was about 25.7 MiB resident at `Freeing unused kernel image`. The policy below is per-flavor data in `targets.json`, applied by `scripts/build.py` and re-checked after Kconfig normalization, so a flavor can opt back in without a code change.
+
+- `KALLSYMS_ALL` and `LATENCYTOP` are off. `LATENCYTOP` selects both `KALLSYMS_ALL` and `SCHEDSTATS`, so all three are cleared in one pass. `KALLSYMS_ALL` alone is 1.4 MiB of `.rodata` on the guest flavor. `KALLSYMS` stays on, so `perf`, `ftrace`, and lockdep still resolve symbols.
+- `LOG_BUF_SHIFT` is 16 and `DYNAMIC_DEBUG` is off, which removes 288 KiB of static log buffers and 100 KiB of `_ddebug` tables.
+- `NR_CPUS` and `HZ` are per-flavor: 512 for the ARM64 flavors, 256 for the x86_64 flavors, 8 for Orange Pi, 4 for Raspberry Pi; 1000 Hz on generic flavors, 300 Hz in the guests, and the vendor value on the boards. Per-CPU allocations and the scheduler tick both scale with these.
+- `INIT_ON_ALLOC_DEFAULT_ON` and `IKCONFIG` are per-flavor. `SCHEDSTATS` is opt-in.
+- `MODULE_UNLOAD` stays on everywhere: it is the only way a rarely used driver returns its memory at runtime.
+- `TRIM_UNUSED_KSYMS` is deliberately never enabled. It shrinks the export table to what in-tree modules use, which breaks out-of-tree DKMS builds against the full table.
+- No compression codec is removed. The audit found only about 37 KiB of resident decompressor code outside Zstd and LZ4, so every codec that a flavor's defconfig selects still ships.
+
+The expected result across the matrix is roughly 2.0-2.3 MiB (8-9 %) less resident memory, plus a smaller on-disk boot image and module tree from Zstd.
+
+## Module signing, compression, and packaging
+
+Set the repository Actions secret `UFLINUX_MODULE_SIGNING_KEY` to the base64-encoded module-signing key in the combined format Kbuild expects: a PKCS#8 RSA private key followed by its self-signed X.509 certificate in one PEM file, the same layout as the `certs/signing_key.pem` the kernel generates for itself. Kbuild reads the certificate out of that file to embed in the kernel and the private key out of it to sign modules, so a key-only PEM is rejected. Generate one with `openssl req -new -x509 -newkey rsa:4096 -noenc -sha256 -days 36500 -keyout key.pem -out cert.pem -config genkey.cnf && cat key.pem cert.pem | base64 -w0`. Every flavor builds with `MODULE_SIG_ALL` and that key, so modules carry a real signer instead of tainting the kernel with `TAINT_UNSIGNED_MODULE`. `MODULE_SIG_FORCE` stays off because locally built DKMS modules are unsigned. `scripts/build.py` publishes the matching certificate once, as `uflinux-module-cert.x509` in the release, and deletes the private key from the object tree so it never reaches an artifact. A build without the secret warns and ships unsigned modules, which is fine for a fork pull request; the job that publishes a release refuses to run without it.
+
+Modules install Zstd-compressed (`.ko.zst`) and the ARM64 EFI flavors compress the boot image with Zstd. Alpine's `kmod` and `mkinitfs` are built against `zstd-dev`, and the in-kernel Zstd decompressor is already resident, so neither the initramfs generator nor early userspace needs anything extra.
+
+Each flavor now publishes two APKs: `linux-uflinux-<target>` (the boot files: kernel image, initramfs inputs, `System.map`, and build config) and `linux-uflinux-<target>-modules` (the whole `/lib/modules/<abi>` tree, including `modules.dep` and the built-in module lists). The kernel package depends on the exactly matching modules package, so `apk add ./linux-uflinux-<target>-<version>-r<revision>.apk` still installs both and the mkinitfs trigger still sees a complete module tree. A driverless guest can keep the kernel package and drop the modules package later if the package manager allows it.
 
 ## Publish and install
 

@@ -88,7 +88,8 @@ printf 'https://dl-cdn.alpinelinux.org/alpine/%s/main\nhttps://dl-cdn.alpinelinu
 cp "$resolved" "$output/resolved.json"
 if [[ "$phase" != package ]]; then
     build_image=$(alpine_image "$resolved" "$builder")
-    build_options=("${container_options[@]}")
+    # Forwarded only when set; an unset -e argument is simply skipped by the runtime.
+    build_options=("${container_options[@]}" -e UFLINUX_MODULE_SIGNING_KEY)
     package_args=()
     if [[ -n ${UFLINUX_KERNEL_PACKAGES:-} ]]; then
         snapshot=$(realpath -e "$UFLINUX_KERNEL_PACKAGES")

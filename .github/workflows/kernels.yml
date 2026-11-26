@@ -10,6 +10,10 @@ on:
         description: Generate profiles for generic and virtual x86_64 and AArch64 kernels
         type: boolean
         default: false
+      force_publish:
+        description: Publish the release even when PGO and BOLT profiles were not generated
+        type: boolean
+        default: false
       profile_target:
         description: Optional target for a profiling build without publication
         type: choice
@@ -37,6 +41,9 @@ jobs:
       fingerprint: ${{ steps.sources.outputs.fingerprint }}
       build: ${{ steps.sources.outputs.build }}
       generate_profiles: ${{ steps.sources.outputs.generate_profiles }}
+      force_publish: ${{ steps.sources.outputs.force_publish }}
+      full_release: ${{ steps.sources.outputs.full_release }}
+      publish: ${{ steps.sources.outputs.publish }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -47,11 +54,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PROFILE_TARGET: ${{ inputs.profile_target || 'none' }}
           GENERATE_PROFILES: ${{ (github.event_name == 'schedule' || inputs.generate_release_profiles) }}
+          FORCE_PUBLISH: ${{ inputs.force_publish }}
           ARM_BOLT: ${{ vars.KERNEL_AARCH64_BOLT_RUNNER }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          MODULE_KEY: ${{ secrets.UFLINUX_MODULE_SIGNING_KEY }}
         run: |
           if [[ "$GENERATE_PROFILES" == true && ( "$PROFILE_TARGET" != none || "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ) ]]; then
             echo "::error::Profile generation requires a full release build on the default branch"
+            exit 1
+          fi
+          if [[ "$FORCE_PUBLISH" == true && "$PROFILE_TARGET" != none ]]; then
+            echo "::error::Force publish requires a full release build, not a single-target profiling build"
             exit 1
           fi
           args=()
@@ -76,7 +89,21 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" == schedule ]] && gh release view "$tag" --json isDraft --jq '.isDraft' | grep -qx false; then
             build=false
           fi
-          printf 'matrix=%s\nprofile_matrix=%s\nbolt_matrix=%s\nfingerprint=%s\nbuild=%s\ngenerate_profiles=%s\n' "$matrix" "$profile_matrix" "$bolt_matrix" "$fingerprint" "$build" "$GENERATE_PROFILES" >> "$GITHUB_OUTPUT"
+          # A full release payload needs every target; a single-target profiling build has none.
+          full_release=false
+          publish=false
+          [[ "$PROFILE_TARGET" != none ]] || full_release=true
+          if [[ "$full_release" == true && "$GITHUB_EVENT_NAME" != pull_request \
+              && "$GITHUB_REF" == "refs/heads/$DEFAULT_BRANCH" \
+              && ( "$GENERATE_PROFILES" == true || "$FORCE_PUBLISH" == true ) ]]; then
+            publish=true
+          fi
+          if [[ "$publish" == true && -z "$MODULE_KEY" ]]; then
+            echo "::error::A published release requires the UFLINUX_MODULE_SIGNING_KEY secret"
+            exit 1
+          fi
+          printf 'matrix=%s\nprofile_matrix=%s\nbolt_matrix=%s\nfingerprint=%s\nbuild=%s\ngenerate_profiles=%s\nforce_publish=%s\nfull_release=%s\npublish=%s\n' \
+            "$matrix" "$profile_matrix" "$bolt_matrix" "$fingerprint" "$build" "$GENERATE_PROFILES" "$FORCE_PUBLISH" "$full_release" "$publish" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         with:
           name: resolved-inputs
@@ -174,6 +201,7 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       UFLINUX_KERNEL_PACKAGES: work/kernel-packages
+      UFLINUX_MODULE_SIGNING_KEY: ${{ secrets.UFLINUX_MODULE_SIGNING_KEY }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -261,6 +289,7 @@ jobs:
       PROFILE_TARGET: ${{ inputs.profile_target || 'none' }}
       REQUIRE_PROFILE: ${{ matrix.profile && needs.resolve.outputs.generate_profiles == 'true' }}
       BOLT_RELEASE: ${{ matrix.profile && needs.resolve.outputs.generate_profiles == 'true' && (matrix.builder == 'x86_64' || vars.KERNEL_AARCH64_BOLT_RUNNER != '') }}
+      UFLINUX_MODULE_SIGNING_KEY: ${{ secrets.UFLINUX_MODULE_SIGNING_KEY }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -328,6 +357,7 @@ jobs:
       TARGET: ${{ matrix.target }}
       UFLINUX_PKGREL: ${{ github.run_number }}
       UFLINUX_KERNEL_PACKAGES: work/kernel-packages
+      UFLINUX_MODULE_SIGNING_KEY: ${{ secrets.UFLINUX_MODULE_SIGNING_KEY }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -402,6 +432,7 @@ jobs:
       PROFILE_TARGET: ${{ inputs.profile_target || 'none' }}
       UFLINUX_PKGREL: ${{ github.run_number }}
       BOLT_RELEASE: ${{ matrix.profile && needs.resolve.outputs.generate_profiles == 'true' && (matrix.builder == 'x86_64' || vars.KERNEL_AARCH64_BOLT_RUNNER != '') }}
+      UFLINUX_MODULE_SIGNING_KEY: ${{ secrets.UFLINUX_MODULE_SIGNING_KEY }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -430,6 +461,11 @@ jobs:
           mkdir -p dist
           cp work/"$TARGET"/*.apk work/"$TARGET"/source-*.tar.zst dist/
           cp work/"$TARGET"/build.json "dist/build-$TARGET.json"
+          # One copy of the embedded module-signing certificate per release: every flavor is
+          # built with the same key, so the generic x86_64 build publishes it.
+          if [[ "$TARGET" == x86_64 && -f work/"$TARGET"/stage/boot/uflinux-module-cert.x509 ]]; then
+            cp work/"$TARGET"/stage/boot/uflinux-module-cert.x509 dist/uflinux-module-cert.x509
+          fi
           case "$TARGET" in
             x86_64|aarch64|orangepi-rv2)
               arch=$(jq -r --arg target "$TARGET" '.[$target].apk' targets.json)
@@ -450,7 +486,7 @@ jobs:
           compression-level: 0
           overwrite: true
       - uses: actions/upload-artifact@v7
-        if: inputs.profile_target == 'none' || inputs.profile_target == ''
+        if: needs.resolve.outputs.full_release == 'true'
         with:
           name: install-${{ matrix.target }}
           path: |
@@ -471,7 +507,7 @@ jobs:
 
   coexist:
     needs: [resolve, build]
-    if: inputs.profile_target == 'none' || inputs.profile_target == ''
+    if: needs.resolve.outputs.full_release == 'true'
     strategy:
       matrix:
         include:
@@ -509,14 +545,14 @@ jobs:
             . /scripts/guest-root.sh
             install_guest_root "$2"
             for flavor in generic virt; do
-              apk_file=$(find "/work/$flavor" -name "*.apk" -type f)
               key_name=$(ls "/work/$flavor/"*.ec.pem.pub)
               cp "$key_name" "/guest/etc/apk/keys/${key_name##*/}"
-              cp "$apk_file" "/guest/$flavor.apk"
+              # Each flavor publishes a kernel package and a matching -modules package.
+              find "/work/$flavor" -name "*.apk" -type f -exec cp {} "/guest/" \;
             done
             cp /work/generic/apk-zstd /guest/tmp/apk-zstd
             chmod +x /guest/tmp/apk-zstd
-            chroot /guest /tmp/apk-zstd add /generic.apk /virt.apk
+            chroot /guest sh -ec '/tmp/apk-zstd add /*.apk'
             for flavor in "$2" "virt-$2"; do
               test -s "/guest/boot/vmlinuz-uflinux-$flavor"
               test -s "/guest/boot/initramfs-uflinux-$flavor"
@@ -525,7 +561,7 @@ jobs:
 
   publish:
     needs: [resolve, build, coexist]
-    if: ${{ !cancelled() && needs.build.result == 'success' && needs.coexist.result == 'success' && github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch && (inputs.profile_target == 'none' || inputs.profile_target == '') }}
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.coexist.result == 'success' && needs.resolve.outputs.publish == 'true' }}
     runs-on: ubuntu-26.04
     concurrency:
       group: kernels-publish-${{ needs.resolve.outputs.fingerprint }}
@@ -561,6 +597,8 @@ jobs:
           for target in $(jq -r 'keys[]' targets.json); do
             files=(dist/linux-uflinux-"$target"-[0-9]*.apk)
             [[ ${#files[@]} == 1 ]]
+            modules=(dist/linux-uflinux-"$target"-modules-[0-9]*.apk)
+            [[ ${#modules[@]} == 1 ]]
             test -s "dist/build-$target.json"
             test -s "dist/source-$target.tar.zst"
           done

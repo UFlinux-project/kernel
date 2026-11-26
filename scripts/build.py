@@ -2,6 +2,7 @@
 """Fetch, patch, configure, and stage one kernel for Alpine packaging."""
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -81,6 +82,68 @@ def bbr_default(kernel, name, symbol):
     return selector
 
 
+def module_signing_key(kernel, obj, target, name):
+    """Install the release module-signing key and return its in-tree path.
+
+    The secret arrives as base64-encoded PEM in UFLINUX_MODULE_SIGNING_KEY, or as
+    a file holding that same value in UFLINUX_MODULE_SIGNING_KEY_FILE. The value is
+    the same combined PEM the kernel generates for itself: a PKCS#8 private key and
+    the matching self-signed X.509 certificate. Kbuild needs both in one file,
+    because `extract-cert` reads the certificate out of it to embed in the kernel
+    while `sign-file` reads the private key out of it to sign modules.
+    The key is written into the object tree under a name that is not the kernel
+    default, so `certs/Makefile` never falls back to generating a random key: every
+    release and debug build of a target then signs modules with the same identity,
+    with the same embedded certificate bytes.
+    """
+    encoded = os.environ.get("UFLINUX_MODULE_SIGNING_KEY", "")
+    if not encoded:
+        path = os.environ.get("UFLINUX_MODULE_SIGNING_KEY_FILE", "")
+        if path:
+            source = Path(path)
+            if source.is_file():
+                encoded = source.read_text().strip()
+    if not encoded:
+        if target.get("module_signing"):
+            # Fork pull requests have no repository secrets. Skip signing instead of
+            # generating a random per-build key, which would be useless downstream; the
+            # release workflow refuses to build without the key.
+            print(f"{name}: no module signing key available, building unsigned", flush=True)
+        return None
+    try:
+        key = base64.b64decode(encoded, validate=True)
+    except Exception:
+        raise SystemExit("UFLINUX_MODULE_SIGNING_KEY is not base64-encoded PEM")
+    if b"-----BEGIN PRIVATE KEY-----" not in key or b"-----END PRIVATE KEY-----" not in key:
+        raise SystemExit("UFLINUX_MODULE_SIGNING_KEY must hold a PKCS#8 private key in PEM form")
+    if b"-----BEGIN CERTIFICATE-----" not in key:
+        raise SystemExit("UFLINUX_MODULE_SIGNING_KEY must also hold the matching X.509 "
+                         "certificate, as a combined key and certificate PEM")
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        raise SystemExit("openssl is required to validate the module signing key")
+    relative = "certs/uflinux-signing_key.pem"
+    dest = obj / relative
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(key)
+    dest.chmod(0o600)
+    # Pin the timestamp so a later repack that re-materialises the key does not make
+    # the already extracted certificate look stale and relink the kernel.
+    os.utime(dest, (0, 0))
+    # Modules are verified by the kernel's RSA verifier on every target (EC support is
+    # not enabled anywhere), so reject anything OpenSSL cannot read as an RSA key pair.
+    run(openssl, "pkey", "-in", str(dest), "-pubout", "-out", "/dev/null")
+    run(openssl, "rsa", "-in", str(dest), "-check", "-noout")
+    # Reject a certificate that does not belong to the key, and one that Kbuild would
+    # refuse to extract or that the kernel could not use for the whole release window.
+    run(openssl, "x509", "-in", str(dest), "-noout", "-checkend", "315360000")
+    key_modulus = run(openssl, "rsa", "-in", str(dest), "-noout", "-modulus", capture=True)
+    cert_modulus = run(openssl, "x509", "-in", str(dest), "-noout", "-modulus", capture=True)
+    if key_modulus.strip() != cert_modulus.strip():
+        raise SystemExit("the certificate in UFLINUX_MODULE_SIGNING_KEY does not match its key")
+    return relative
+
+
 def configure(kernel, obj, target, name, kbuild, bbr, gcc=False):
     config = obj / ".config"
     if "config_url" in target:
@@ -104,11 +167,16 @@ def configure(kernel, obj, target, name, kbuild, bbr, gcc=False):
         crypto += ("CRYPTO_MLDSA",)
     # Lockdown can select MODULE_SIG. Clear the key too so Kbuild does not
     # embed a random certificate and change the ELF build ID between builds.
+    # Signing is switched back on below when a release signing key is available.
     set_config("--set-str", "LOCALVERSION", f"-uflinux-{name}", "-d", "LOCALVERSION_AUTO",
                "-e", "MODULES", "-d", "MODULE_SIG", "-d", "MODULE_SIG_ALL", "--set-str", "MODULE_SIG_KEY", "",
                "--set-str", "SYSTEM_TRUSTED_KEYS", "",
                "--set-str", "SYSTEM_REVOCATION_KEYS", "", "-d", "WERROR", "-d", "RUST",
                "-d", "GCC_PLUGINS", "-e", "DEBUG_INFO_NONE", "-d", "DEBUG_INFO_BTF", "-d", "DEBUG_INFO_BTF_MODULES",
+               # DEBUG_INFO_NONE is a choice member: clear the DWARF options the vendor configs
+               # enable, or olddefconfig keeps DEBUG_INFO (and its debug sections) switched on.
+               "-d", "DEBUG_INFO_DWARF5", "-d", "DEBUG_INFO_DWARF4",
+               "-d", "DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT",
                "-e", "TCP_CONG_ADVANCED", "-e", "TCP_CONG_CUBIC", "-e", symbol, "-e", selector,
                "-e", "LRU_GEN", "-e", "LRU_GEN_ENABLED", "-e", "SWAP", "-e", "ZSWAP", "-d", "ZSWAP_DEFAULT_ON",
                "-e", "ZSWAP_COMPRESSOR_DEFAULT_ZSTD", "-e", "CRYPTO_LZ4", "-e", "CRYPTO_ZSTD",
@@ -130,6 +198,58 @@ def configure(kernel, obj, target, name, kbuild, bbr, gcc=False):
                    "-e", "EXT4_FS", "-e", "SERIAL_8250_CONSOLE" if target["arch"] == "x86"
                    else "SERIAL_AMBA_PL011_CONSOLE")
     set_config("-d", "AUTOFDO_CLANG", "-d", "LTO_CLANG_FULL")
+    # Resident-footprint policy. Everything here is data in targets.json so a flavor can
+    # opt back in without touching code. See README "Memory footprint policy".
+    set_config("-d", "LATENCYTOP", "-d", "KALLSYMS_ALL", "-d", "LIVEPATCH",
+               "-d", "PRINTK_INDEX", "-d", "BOOT_PRINTK_DELAY")
+    # LATENCYTOP selects KALLSYMS_ALL and SCHEDSTATS, so it has to be cleared in the same
+    # pass; KALLSYMS_ALL is what makes perf lose data symbols, and it is the single largest
+    # saving available (1.4 MiB of .rodata on virt-x86_64).
+    if not target.get("schedstats", False):
+        set_config("-d", "SCHEDSTATS")
+    else:
+        set_config("-e", "SCHEDSTATS")
+    if not target.get("dynamic_debug", False):
+        set_config("-d", "DYNAMIC_DEBUG")
+    if not target.get("ikconfig", True):
+        set_config("-d", "IKCONFIG", "-d", "IKCONFIG_PROC")
+    if not target.get("init_on_alloc", True):
+        set_config("-d", "INIT_ON_ALLOC_DEFAULT_ON")
+    for option, key in (("LOG_BUF_SHIFT", "log_buf_shift"), ("NR_CPUS", "nr_cpus")):
+        if key in target:
+            set_config("--set-val", option, str(target[key]))
+    if "hz" in target:
+        set_config(*[flag for hz in (100, 250, 300, 1000)
+                     for flag in ("-e" if hz == target["hz"] else "-d", f"HZ_{hz}")])
+    # Module loading: sign every module with the release key and store them zstd-compressed.
+    # ZSTD_DECOMPRESS is already built in everywhere, so in-kernel decompression is free and
+    # keeps initramfs generators from needing their own zstd support.
+    signing_key = module_signing_key(kernel, obj, target, name) if target.get("module_signing") else None
+    if signing_key:
+        # MODULE_SIG_FORCE stays off: out-of-tree modules built locally (DKMS) are unsigned,
+        # and lockdown integrity already requires a valid signature when it is active.
+        set_config("-e", "MODULE_SIG", "-e", "MODULE_SIG_ALL", "-d", "MODULE_SIG_FORCE",
+                   "-e", "MODULE_SIG_KEY_TYPE_RSA", "-e", "MODULE_SIG_SHA256",
+                   "--set-str", "MODULE_SIG_KEY", signing_key)
+    else:
+        set_config("-d", "MODULE_SIG", "-d", "MODULE_SIG_ALL", "--set-str", "MODULE_SIG_KEY", "")
+    # Module unload stays on everywhere: it is the only way a rarely used driver gives its
+    # memory back at runtime. TRIM_UNUSED_KSYMS is deliberately never enabled because it
+    # breaks out-of-tree (DKMS) modules, which are built against the full export table.
+    set_config("-e", "MODULE_UNLOAD", "-d", "TRIM_UNUSED_KSYMS")
+    if target.get("module_compression", "zstd") == "zstd":
+        options = ["-d", "MODULE_COMPRESS_NONE", "-d", "MODULE_COMPRESS_GZIP",
+                   "-d", "MODULE_COMPRESS_XZ", "-e", "MODULE_COMPRESS_ZSTD",
+                   "-e", "MODULE_DECOMPRESS"]
+        if re.search(r"^config MODULE_COMPRESS_ALL\b", (kernel / "kernel/module/Kconfig").read_text(), re.M):
+            # Compressed module installation is gated on this option from 6.7 onwards.
+            options += ["-e", "MODULE_COMPRESS", "-e", "MODULE_COMPRESS_ALL"]
+        set_config(*options)
+    # Boot-image compression: the zstd decompressor is already resident on every target that
+    # can select an image compressor, so this only changes the on-disk image and the boot path.
+    if target.get("kernel_compression") == "zstd":
+        set_config("-d", "KERNEL_GZIP", "-d", "KERNEL_LZ4", "-d", "KERNEL_LZMA", "-d", "KERNEL_XZ",
+                   "-e", "KERNEL_ZSTD")
     if re.search(r"^config SCHED_BORE\b", (kernel / "init/Kconfig").read_text(), re.M):
         set_config("-e", "SCHED_BORE")
     if not gcc:
@@ -145,6 +265,35 @@ def configure(kernel, obj, target, name, kbuild, bbr, gcc=False):
     missing_crypto = [f"CONFIG_{key}" for key in crypto if effective.get(key) != "y"]
     if missing_crypto:
         raise SystemExit(f"{name}: required crypto options are not built in: {', '.join(missing_crypto)}")
+    # Footprint invariants: catch a vendor or upstream config that re-enables a dropped
+    # option through a select, and make sure the compression codecs stay in the kernel.
+    forbidden = ["LATENCYTOP", "KALLSYMS_ALL", "TRIM_UNUSED_KSYMS", "DEBUG_INFO"]
+    if not target.get("schedstats", False):
+        forbidden.append("SCHEDSTATS")
+    if not target.get("dynamic_debug", False):
+        forbidden.append("DYNAMIC_DEBUG")
+    if not target.get("ikconfig", True):
+        forbidden.append("IKCONFIG")
+    if not target.get("init_on_alloc", True):
+        forbidden.append("INIT_ON_ALLOC_DEFAULT_ON")
+    unexpected = [option for option in forbidden if effective.get(option) in {"y", "m"}]
+    for option, key in (("LOG_BUF_SHIFT", "log_buf_shift"), ("NR_CPUS", "nr_cpus"), ("HZ", "hz")):
+        if key in target and effective.get(option) != str(target[key]):
+            unexpected.append(f"{option}={target[key]}")
+    if unexpected:
+        raise SystemExit(f"{name}: footprint policy violated by {', '.join(unexpected)}")
+    if signing_key and (effective.get("MODULE_SIG_ALL") != "y"
+                        or effective.get("MODULE_SIG_KEY") != f'"{signing_key}"'):
+        raise SystemExit(f"{name}: module signing is not using {signing_key}")
+    # Codecs are additive here: dropping one saves ~37 KiB and breaks formats users rely on.
+    for option in ("ZLIB_INFLATE", "XZ_DEC", "LZ4_DECOMPRESS", "LZO_DECOMPRESS", "ZSTD_DECOMPRESS",
+                   "DECOMPRESS_GZIP", "DECOMPRESS_ZSTD", "RD_ZSTD", "SQUASHFS_ZSTD"):
+        if option in effective and effective[option] not in {"y", "m"}:
+            raise SystemExit(f"{name}: compression codec CONFIG_{option} disappeared")
+    if target.get("module_compression", "zstd") == "zstd" and effective.get("MODULE_COMPRESS_ZSTD") != "y":
+        raise SystemExit(f"{name}: modules are not configured for zstd compression")
+    if target.get("kernel_compression") == "zstd" and effective.get("KERNEL_ZSTD") != "y":
+        raise SystemExit(f"{name}: the kernel image is not configured for zstd compression")
     expected_i915 = name == "x86_64"
     if (expected_i915 and effective.get("DRM_I915") != "m") or (
             not expected_i915 and effective.get("DRM_I915") in {"y", "m"}):
@@ -290,6 +439,11 @@ def apply_collected_bolt(output, name, target, kbuild):
     metadata = json.loads((output / "build.json").read_text())
     pgo, pgo_data = profile(name, "pgo", target)
     bolt, bolt_data = profile(name, "bolt", target)
+    module_key = (metadata.get("module_signing_key") or "").strip('"')
+    if module_key:
+        # The repack relinks vmlinux, and `certs/signing_key.x509` lists the private key as a
+        # prerequisite, so the key has to exist again even though it is never published.
+        module_signing_key(kernel, obj, target, name)
     optimizer = shutil.which("llvm-bolt")
     if (metadata["target"] != name or metadata["source"] != target["ref"] or not metadata["pgo"]
             or not pgo or pgo_data.get("identity") != metadata["pgo_identity"]
@@ -331,6 +485,9 @@ def apply_collected_bolt(output, name, target, kbuild):
     boot = output / "stage" / "boot"
     shutil.copy2(image, boot / f"vmlinuz-uflinux-{name}")
     shutil.copy2(obj / "System.map", boot / f"System.map-uflinux-{name}")
+    module_key = (metadata.get("module_signing_key") or "").strip('"')
+    if module_key:
+        (obj / module_key).unlink(missing_ok=True)
     metadata["bolt"] = True
     metadata["bolt_input_sha256"] = bolt_data["input_sha256"]
     metadata["bolt_profile_sha256"] = bolt_data["sha256"]
@@ -467,6 +624,15 @@ def main():
         raise SystemExit(f"Unexpected kernel ELF machine for {target['apk']}")
     abi = run(*kbuild, "-s", "kernelrelease", capture=True).strip()
     stage(kernel, obj, output / "stage", name, target, kbuild, image, abi)
+    module_key = (settings.get("MODULE_SIG_KEY") or '""').strip('"')
+    if settings.get("MODULE_SIG_ALL") == "y" and module_key:
+        # Publish the certificate modules are signed against. The private key stays in the
+        # object tree only while a BOLT repack still needs it, so it never reaches an artifact.
+        certificate = obj / "certs" / "signing_key.x509"
+        if not certificate.is_file():
+            raise SystemExit(f"{name}: module signing produced no certificate")
+        shutil.copy2(certificate, output / "stage" / "boot" / "uflinux-module-cert.x509")
+        (obj / module_key).unlink(missing_ok=True)
     shutil.copy2(obj / ".config", output / "kernel.config")
     if args.profile_build or args.bolt_baseline:
         unstripped = obj / "vmlinux.unstripped"
@@ -491,6 +657,7 @@ def main():
                 "lto": next((key for key in ("LTO_CLANG_THIN_DIST", "LTO_CLANG_THIN") if settings.get(key) == "y"), "none"),
                 "optimization": "-O3" if flags else "Kbuild default",
                 "config_sha256": hashlib.sha256((obj / ".config").read_bytes()).hexdigest(),
+                "module_signing_key": module_key,
                 "compiler": compiler, "pgo_identity": identity,
                 "pgo_sha256": pgo_data["sha256"] if pgo else None}
     if args.bolt_baseline and x86:
