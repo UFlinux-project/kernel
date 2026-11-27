@@ -24,6 +24,13 @@ def values(config):
     return dict(re.findall(r"^CONFIG_(\w+)=(.*)$", config.read_text(), re.M))
 
 
+# Every MODULE_SIG hash choice member across the supported sources. Older trees have no
+# SHA-3 members; scripts/config writes them anyway and olddefconfig drops the unknown names.
+MODULE_SIG_HASHES = ("MODULE_SIG_SHA1", "MODULE_SIG_SHA224", "MODULE_SIG_SHA256",
+                     "MODULE_SIG_SHA384", "MODULE_SIG_SHA512", "MODULE_SIG_SHA3_256",
+                     "MODULE_SIG_SHA3_384", "MODULE_SIG_SHA3_512")
+
+
 def get(url, dest):
     run("curl", "--fail", "--location", "--retry", "3", "--silent", "--show-error",
         "--output", str(dest), url)
@@ -130,16 +137,18 @@ def module_signing_key(kernel, obj, target, name):
     # Pin the timestamp so a later repack that re-materialises the key does not make
     # the already extracted certificate look stale and relink the kernel.
     os.utime(dest, (0, 0))
-    # Modules are verified by the kernel's RSA verifier on every target (EC support is
-    # not enabled anywhere), so reject anything OpenSSL cannot read as an RSA key pair.
+    # The key is EC NIST P-384 by default, so check it through the algorithm agnostic
+    # `pkey` interface; `rsa -check` and `-modulus` both fail on an elliptic curve key.
+    run(openssl, "pkey", "-in", str(dest), "-check", "-noout")
     run(openssl, "pkey", "-in", str(dest), "-pubout", "-out", "/dev/null")
-    run(openssl, "rsa", "-in", str(dest), "-check", "-noout")
     # Reject a certificate that does not belong to the key, and one that Kbuild would
     # refuse to extract or that the kernel could not use for the whole release window.
     run(openssl, "x509", "-in", str(dest), "-noout", "-checkend", "315360000")
-    key_modulus = run(openssl, "rsa", "-in", str(dest), "-noout", "-modulus", capture=True)
-    cert_modulus = run(openssl, "x509", "-in", str(dest), "-noout", "-modulus", capture=True)
-    if key_modulus.strip() != cert_modulus.strip():
+    # Compare the public part as PEM text. DER would not work: the two commands emit the
+    # key with different surrounding structures. This holds for RSA and EC alike.
+    key_public = run(openssl, "pkey", "-in", str(dest), "-pubout", capture=True)
+    cert_public = run(openssl, "x509", "-in", str(dest), "-noout", "-pubkey", capture=True)
+    if key_public.strip() != cert_public.strip():
         raise SystemExit("the certificate in UFLINUX_MODULE_SIGNING_KEY does not match its key")
     return relative
 
@@ -225,11 +234,25 @@ def configure(kernel, obj, target, name, kbuild, bbr, gcc=False):
     # ZSTD_DECOMPRESS is already built in everywhere, so in-kernel decompression is free and
     # keeps initramfs generators from needing their own zstd support.
     signing_key = module_signing_key(kernel, obj, target, name) if target.get("module_signing") else None
+    # EC NIST P-384 with sha384 by default: the signature trailer is ~380 B smaller per
+    # module than RSA-4096/sha256 once zstd-compressed, and verifying an ECDSA-P384 signature
+    # is cheaper at load than an RSA-4096 one. CRYPTO_RSA stays resident regardless, because
+    # MODULE_SIG selects SYSTEM_DATA_VERIFICATION, which selects it.
+    # sha384 is the only hash every supported source allows next to an EC key: 6.50 onwards
+    # MODULE_SIG_KEY_TYPE_ECDSA depends on !(MODULE_SIG_SHA256 || MODULE_SIG_SHA3_256), and
+    # Kconfig would silently fall back to RSA. A flavor can still pick rsa/sha256.
+    signing_type = target.get("module_sig_key_type", "ECDSA")
+    signing_hash = target.get("module_sig_hash", "sha384")
     if signing_key:
         # MODULE_SIG_FORCE stays off: out-of-tree modules built locally (DKMS) are unsigned,
         # and lockdown integrity already requires a valid signature when it is active.
+        # The hashes are a choice, so clear the alternatives: scripts/config writes the lines
+        # and olddefconfig would otherwise keep whichever member the base config selected.
+        wanted_hash = f"MODULE_SIG_{signing_hash.upper()}"
         set_config("-e", "MODULE_SIG", "-e", "MODULE_SIG_ALL", "-d", "MODULE_SIG_FORCE",
-                   "-e", "MODULE_SIG_KEY_TYPE_RSA", "-e", "MODULE_SIG_SHA256",
+                   "-e", f"MODULE_SIG_KEY_TYPE_{signing_type}",
+                   *(option for option in MODULE_SIG_HASHES
+                     for option in ("-e" if option == wanted_hash else "-d", option)),
                    "--set-str", "MODULE_SIG_KEY", signing_key)
     else:
         set_config("-d", "MODULE_SIG", "-d", "MODULE_SIG_ALL", "--set-str", "MODULE_SIG_KEY", "")
@@ -285,6 +308,14 @@ def configure(kernel, obj, target, name, kbuild, bbr, gcc=False):
     if signing_key and (effective.get("MODULE_SIG_ALL") != "y"
                         or effective.get("MODULE_SIG_KEY") != f'"{signing_key}"'):
         raise SystemExit(f"{name}: module signing is not using {signing_key}")
+    if signing_key:
+        # A base config that keeps MODULE_SIG_SHA256 selected silently voids the ECDSA
+        # choice, and Kbuild then builds an RSA key into the kernel while the modules are
+        # signed with the EC one. Check the effective values, not the requested ones.
+        if effective.get(f"MODULE_SIG_KEY_TYPE_{signing_type}") != "y":
+            raise SystemExit(f"{name}: module signing key type is not {signing_type}")
+        if effective.get("MODULE_SIG_HASH") != f'"{signing_hash}"':
+            raise SystemExit(f"{name}: modules are not signed with {signing_hash}")
     # Codecs are additive here: dropping one saves ~37 KiB and breaks formats users rely on.
     for option in ("ZLIB_INFLATE", "XZ_DEC", "LZ4_DECOMPRESS", "LZO_DECOMPRESS", "ZSTD_DECOMPRESS",
                    "DECOMPRESS_GZIP", "DECOMPRESS_ZSTD", "RD_ZSTD", "SQUASHFS_ZSTD"):

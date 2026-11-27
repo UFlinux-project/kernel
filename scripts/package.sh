@@ -60,6 +60,15 @@ test -s "/guest/lib/modules/$abi/modules.dep"
 module=$(find "/guest/lib/modules/$abi" -type f -name '*.ko*' -print -quit)
 test -n "$module"
 test "$(modinfo -F vermagic "$module" | cut -d ' ' -f1)" = "$abi"
+# A module with no dependencies can be loaded on its own, which is what proves the kernel
+# accepted its signature at runtime rather than just carrying the right modinfo fields.
+# Prefer a software-only crypto or library module: those never need hardware to load.
+depfile="/guest/lib/modules/$abi/modules.dep"
+sigmodule=$(awk -F: '$2 == "" && $1 ~ /^kernel\/(crypto|lib)\// {print $1; exit}' "$depfile")
+test -n "$sigmodule" || sigmodule=$(awk -F: '$2 == "" && $1 ~ /\.ko/ {print $1; exit}' "$depfile")
+sigmodule=${sigmodule##*/}
+sigmodule=${sigmodule%%.ko*}
+sigmodule=${sigmodule//-/_}
 if [ -s "/out/stage/boot/uflinux-module-cert.x509" ]; then
     # The signer field is the subject commonName of the embedded certificate.
     signer=$(openssl x509 -in "/out/stage/boot/uflinux-module-cert.x509" -noout -subject -nameopt multiline,utf8 \
@@ -79,10 +88,11 @@ if [ -n "$profile_guest" ]; then
     apk --root /guest add --no-progress fio iperf3
     install -m 755 "$(dirname "$0")/profile-guest.sh" /guest/sbin/uflinux-profile
 fi
-python3 - /out/build.json <<'PY'
+python3 - /out/build.json "$sigmodule" <<'PY'
 import json, sys
 from pathlib import Path
 meta = json.loads(Path(sys.argv[1]).read_text())
+sigmodule = sys.argv[2] if len(sys.argv) > 2 else ''
 script = '''#!/bin/sh
 set -eu
 grep -qs " /proc proc " /proc/mounts || mount -t proc proc /proc
@@ -107,6 +117,7 @@ rm -f /dev/bbr-fifo
 @MGLRU@
 @LE9UO@
 modprobe virtio_net || test -d /sys/class/net/eth0
+@SIGMODULE@
 @TAINT@
 ip link set eth0 up
 ip addr add 10.0.2.15/24 dev eth0
@@ -116,6 +127,10 @@ echo UFLINUX_BOOT_OK
 poweroff -f
 '''
 script = script.replace("@ABI@", meta["abi"]).replace("@BBR@", meta["bbrv3"])
+# Loading a signed module and then checking the taint word is the only end-to-end proof
+# that the embedded key verifies the signatures the build attached.
+script = script.replace("@SIGMODULE@", f'modprobe {sigmodule}\ngrep -q "^{sigmodule} " /proc/modules'
+                        if meta.get("module_signing_key") and sigmodule else ':')
 # Bit 13 is TAINT_UNSIGNED_MODULE. Only an actually signed kernel can be held to it.
 script = script.replace("@TAINT@", 'test "$(( $(cat /proc/sys/kernel/tainted) & 8192 ))" = 0'
                         if meta.get("module_signing_key") else ':')
