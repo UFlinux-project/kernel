@@ -462,9 +462,10 @@ jobs:
           cp work/"$TARGET"/*.apk work/"$TARGET"/source-*.tar.zst dist/
           cp work/"$TARGET"/build.json "dist/build-$TARGET.json"
           # One copy of the embedded module-signing certificate per release: every flavor is
-          # built with the same key, so the generic x86_64 build publishes it.
-          if [[ "$TARGET" == x86_64 && -f work/"$TARGET"/stage/boot/uflinux-module-cert.x509 ]]; then
-            cp work/"$TARGET"/stage/boot/uflinux-module-cert.x509 dist/uflinux-module-cert.x509
+          # built with the same key, so the generic x86_64 build publishes it. In a package the
+          # file is per-flavor, so that two kernels can share a root.
+          if [[ "$TARGET" == x86_64 && -f work/"$TARGET"/stage/boot/module-cert-uflinux-x86_64.x509 ]]; then
+            cp work/"$TARGET"/stage/boot/module-cert-uflinux-x86_64.x509 dist/uflinux-module-cert.x509
           fi
           case "$TARGET" in
             x86_64|aarch64|orangepi-rv2)

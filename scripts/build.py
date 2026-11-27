@@ -659,10 +659,11 @@ def main():
     if settings.get("MODULE_SIG_ALL") == "y" and module_key:
         # Publish the certificate modules are signed against. The private key stays in the
         # object tree only while a BOLT repack still needs it, so it never reaches an artifact.
+        # The per-flavor name keeps the file out of apk's way when two kernels share a root.
         certificate = obj / "certs" / "signing_key.x509"
         if not certificate.is_file():
             raise SystemExit(f"{name}: module signing produced no certificate")
-        shutil.copy2(certificate, output / "stage" / "boot" / "uflinux-module-cert.x509")
+        shutil.copy2(certificate, output / "stage" / "boot" / f"module-cert-uflinux-{name}.x509")
         (obj / module_key).unlink(missing_ok=True)
     shutil.copy2(obj / ".config", output / "kernel.config")
     if args.profile_build or args.bolt_baseline:

@@ -69,9 +69,9 @@ test -n "$sigmodule" || sigmodule=$(awk -F: '$2 == "" && $1 ~ /\.ko/ {print $1; 
 sigmodule=${sigmodule##*/}
 sigmodule=${sigmodule%%.ko*}
 sigmodule=${sigmodule//-/_}
-if [ -s "/out/stage/boot/uflinux-module-cert.x509" ]; then
+if [ -s "/out/stage/boot/module-cert-uflinux-$name.x509" ]; then
     # The signer field is the subject commonName of the embedded certificate.
-    signer=$(openssl x509 -in "/out/stage/boot/uflinux-module-cert.x509" -noout -subject -nameopt multiline,utf8 \
+    signer=$(openssl x509 -in "/out/stage/boot/module-cert-uflinux-$name.x509" -noout -subject -nameopt multiline,utf8 \
         | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p')
     test -n "$signer"
     test "$(modinfo -F signer "$module")" = "$signer"
