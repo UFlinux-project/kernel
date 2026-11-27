@@ -552,7 +552,7 @@ jobs:
             done
             cp /work/generic/apk-zstd /guest/tmp/apk-zstd
             chmod +x /guest/tmp/apk-zstd
-            chroot /guest sh -ec '/tmp/apk-zstd add /*.apk'
+            chroot /guest sh -ec "/tmp/apk-zstd add /*.apk"
             for flavor in "$2" "virt-$2"; do
               test -s "/guest/boot/vmlinuz-uflinux-$flavor"
               test -s "/guest/boot/initramfs-uflinux-$flavor"
