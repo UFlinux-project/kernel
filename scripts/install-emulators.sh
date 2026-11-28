@@ -18,7 +18,7 @@ case "${1:?Specify a kernel target}" in
     sudo apt-get update
     sudo apt-get install -y qemu-system-arm
     ;;
-  x86_64|virt-x86_64)
+  x86_64|nvidia|virt-x86_64)
     sudo apt-get update
     sudo apt-get install -y qemu-system-x86
     ;;

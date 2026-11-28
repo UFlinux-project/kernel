@@ -13,7 +13,7 @@ case "$mode" in
     *) exit 2 ;;
 esac
 case "$target" in
-    x86_64|virt-x86_64)
+    x86_64|nvidia|virt-x86_64)
         emulator=qemu-system-x86_64
         machine=q35
         serial=ttyS0

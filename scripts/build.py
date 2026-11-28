@@ -196,9 +196,12 @@ def configure(kernel, obj, target, name, kbuild, bbr, gcc=False):
     if name == "rpi":
         set_config("-e", "ARM64_4K_PAGES")
     virt = name.startswith("virt-")
+    # The nvidia flavor ships the out-of-tree open kernel modules instead of nouveau, and
+    # keeping nouveau built-in would let it claim the GPU before nvidia.ko is loaded.
     for driver in ("DRM_AMDGPU", "DRM_RADEON", "DRM_NOUVEAU", "DRM_XE"):
-        set_config("-d" if virt else "-m", driver)
-    set_config("-m" if name == "x86_64" else "-d", "DRM_I915")
+        drop = virt or (driver == "DRM_NOUVEAU" and target.get("nvidia_open"))
+        set_config("-d" if drop else "-m", driver)
+    set_config("-m" if name in ("x86_64", "nvidia") else "-d", "DRM_I915")
     if virt:
         set_config("-e", "PCI", "-e", "EFI", "-e", "EFI_STUB", "-e", "VIRTIO_PCI",
                    "-e", "VIRTIO_MMIO", "-e", "VIRTIO_BLK", "-e", "SCSI", "-e", "BLK_DEV_SD",
@@ -325,7 +328,7 @@ def configure(kernel, obj, target, name, kbuild, bbr, gcc=False):
         raise SystemExit(f"{name}: modules are not configured for zstd compression")
     if target.get("kernel_compression") == "zstd" and effective.get("KERNEL_ZSTD") != "y":
         raise SystemExit(f"{name}: the kernel image is not configured for zstd compression")
-    expected_i915 = name == "x86_64"
+    expected_i915 = name in ("x86_64", "nvidia")
     if (expected_i915 and effective.get("DRM_I915") != "m") or (
             not expected_i915 and effective.get("DRM_I915") in {"y", "m"}):
         raise SystemExit("Unexpected i915 configuration")
@@ -421,6 +424,90 @@ def x86_bug_entry_size(kernel, settings):
     return size
 
 
+def nvidia_modules(kernel, obj, stage_dir, output, name, target, abi, jobs):
+    """Build NVIDIA's out-of-tree open kernel modules against this kernel and install them into the staged module tree.
+
+    The install goes through the kernel's own modules_install rules, so the driver modules are
+    stripped, signed with the flavor's signing key, compressed and covered by depmod exactly like
+    an in-tree module. It must therefore run while the private signing key is still present.
+
+    NVIDIA supports "the current kernel series or older", so a kernel newer than the driver shows
+    up as an ordinary compile error rather than a clean refusal. The driver is a separate optional
+    package, so that failure costs only this flavor's driver APK: the reason is recorded in the
+    returned metadata and the staged tree is left as if the flavor had no driver, so the kernel and
+    modules APKs still get packaged and published.
+    """
+    info = target.get("nvidia") or {}
+    modules = target.get("nvidia_modules") or []
+    if not modules:
+        raise SystemExit(f"{name}: nvidia target lists no modules")
+    url = info.get("url")
+    if not url:
+        # The resolver could not read the newest release, so there is nothing to build. Report the
+        # reason instead of failing: the flavor still publishes its kernel and modules packages.
+        reason = info.get("error") or "the flavor had no resolved NVIDIA driver release"
+        return {"version": None, "ref": "", "url": None, "sha256": None, "modules": [],
+                "error": f"NVIDIA open kernel modules did not build against {abi}, so {name} "
+                         f"publishes without a driver package ({reason})"}
+    version = str(info.get("version", "")).strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise SystemExit(f"{name}: unexpected nvidia driver version {version!r}")
+    record = {"version": version, "ref": info.get("ref", ""), "url": url, "sha256": None, "modules": []}
+    source = output / "nvidia-open"
+    if source.exists():
+        shutil.rmtree(source)
+    source.mkdir(parents=True)
+    archive = output / "nvidia-open.tar.gz"
+    directory = stage_dir / "lib/modules" / abi / "kernel/drivers/video"
+    try:
+        get(url, archive)
+        digest = hashlib.sha256()
+        with archive.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        record["sha256"] = digest.hexdigest()
+        run("tar", "-xf", archive, "-C", source, "--strip-components=1", "--no-same-owner")
+        if not (source / "kernel-open/Makefile").is_file():
+            raise RuntimeError("NVIDIA sources have no kernel-open directory")
+        # Build from the top of the tree: the source package ships no prebuilt object for the OS
+        # agnostic core, so its top level Makefile has to compile src/nvidia and src/nvidia-modeset
+        # and link them into kernel-open before Kbuild can build the modules themselves. The driver
+        # wants the uname machine name rather than Kbuild's ARCH and maps it itself, and it falls
+        # back to the first word of CONFIG_CC_VERSION_TEXT for the compiler, which for our kernel is
+        # "Alpine" rather than a command, so hand it the kernel's own toolchain. Command line
+        # variables are forwarded to the recursive make invocations, so kernel-open sees all of them.
+        uname_arch = {"x86_64": "x86_64", "aarch64": "arm64", "riscv64": "riscv"}[target["apk"]]
+        build = ["make", "-C", source, f"SYSSRC={kernel}", f"SYSOUT={obj}", f"ARCH={uname_arch}",
+                 f"NV_KERNEL_MODULES={' '.join(modules)}", "INSTALL_MOD_DIR=kernel/drivers/video",
+                 "CC=clang", "LD=ld.lld", "OBJDUMP=llvm-objdump", "LLVM=1", "LLVM_IAS=1", jobs]
+        run(*build, "modules")
+        run(*build, "modules_install", f"INSTALL_MOD_PATH={stage_dir}", "INSTALL_MOD_STRIP=1")
+        for module in modules:
+            # The driver splits each module into a stripped .ko and a .ko.debug holding the
+            # remaining symbols; drop the debug copy (the flavor is built with
+            # CONFIG_DEBUG_INFO_NONE) and keep the name and compression that module loading expects.
+            (directory / f"{module}.ko.debug").unlink(missing_ok=True)
+            if not (directory / f"{module}.ko.zst").is_file():
+                raise RuntimeError(f"missing nvidia module {module}")
+        record["modules"] = modules
+    except (subprocess.CalledProcessError, OSError, RuntimeError) as error:
+        reason = (f"exit status {error.returncode}" if isinstance(error, subprocess.CalledProcessError)
+                  else str(error))
+        record["error"] = (f"NVIDIA open kernel modules {version} did not build against {abi}, so "
+                           f"{name} publishes without a driver package ({reason})")
+        print(f"{name}: {record['error']}", flush=True)
+        # A failed install can leave a half-populated tree behind, and modules.dep would still name
+        # modules that are gone. Drop whatever was installed and have depmod rebuild the dependency
+        # files from the in-tree modules alone, exactly as an in-tree modules_install would.
+        if directory.is_dir():
+            for leftover in directory.glob("nvidia*.ko*"):
+                leftover.unlink(missing_ok=True)
+        run("depmod", "-ae", "-F", str(obj / "System.map"), "-b", str(stage_dir), abi)
+    finally:
+        archive.unlink(missing_ok=True)
+    return record
+
+
 def stage(kernel, obj, dest, name, target, kbuild, image, abi):
     boot = dest / "boot"
     boot.mkdir(parents=True)
@@ -433,7 +520,7 @@ def stage(kernel, obj, dest, name, target, kbuild, image, abi):
         (modules / link).unlink(missing_ok=True)
     (modules / "kernel-suffix").write_text(f"-uflinux-{name}\n")
     (modules / "vmlinuz").symlink_to(f"/boot/vmlinuz-uflinux-{name}")
-    if name == "x86_64" and not list(modules.rglob("i915.ko*")):
+    if name in ("x86_64", "nvidia") and not list(modules.rglob("i915.ko*")):
         raise SystemExit("Missing i915 module")
     if target["arch"] != "x86":
         dtbs = boot / f"dtbs-uflinux-{name}"
@@ -655,6 +742,7 @@ def main():
         raise SystemExit(f"Unexpected kernel ELF machine for {target['apk']}")
     abi = run(*kbuild, "-s", "kernelrelease", capture=True).strip()
     stage(kernel, obj, output / "stage", name, target, kbuild, image, abi)
+    driver = nvidia_modules(kernel, obj, output / "stage", output, name, target, abi, jobs) if target.get("nvidia_open") else None
     module_key = (settings.get("MODULE_SIG_KEY") or '""').strip('"')
     if settings.get("MODULE_SIG_ALL") == "y" and module_key:
         # Publish the certificate modules are signed against. The private key stays in the
@@ -682,6 +770,8 @@ def main():
         omissions["Distributed ThinLTO"] = "Unavailable in the effective Kconfig"
     if settings.get("LRU_GEN_ENABLED") != "y":
         omissions["MGLRU"] = "No MGLRU boot-default support in the effective Kconfig"
+    if driver and driver.get("error"):
+        omissions["NVIDIA open driver"] = driver["error"]
     metadata = {"target": name, "arch": target["apk"], "version": target["version"],
                 "source": target["ref"], "source_url": target["url"], "abi": abi, "patches": records,
                 "pgo": bool(pgo), "pgo_instrumented": args.profile_build, "bolt": bolt_applied, "omissions": omissions,
@@ -692,6 +782,8 @@ def main():
                 "module_signing_key": module_key,
                 "compiler": compiler, "pgo_identity": identity,
                 "pgo_sha256": pgo_data["sha256"] if pgo else None}
+    if driver:
+        metadata["nvidia"] = driver
     if args.bolt_baseline and x86:
         metadata["bolt_bug_entry_size"] = bug_entry_size
     write_build_metadata(output, name, metadata)

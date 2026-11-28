@@ -15,11 +15,22 @@ openssl pkey -in "$key" -pubout -out "$key.pub"
 cp "$key.pub" /etc/apk/keys/
 package="linux-uflinux-$name"
 modules_package="$package-modules"
+driver_package="$package-nvidia-open"
 release="$version-r$revision"
 abi=$(find /out/stage/lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
 # The module tree is its own package, so a guest only pays for the drivers it needs.
 mkdir -p /out/modules-root/lib
 mv /out/stage/lib/modules /out/modules-root/lib/modules
+# Out-of-tree drivers are versioned with the driver, not the kernel, and only NVIDIA users need
+# them, so they ship as a third package. They stay under the same module tree, where depmod runs.
+drivers=/out/modules-root/lib/modules/"$abi"/kernel/drivers/video
+mkdir -p /out/driver-root/lib/modules/"$abi"/kernel/drivers/video
+if [ -d "$drivers" ] && find "$drivers" -maxdepth 1 -name 'nvidia*.ko*' | grep -q .; then
+    mv "$drivers"/nvidia* /out/driver-root/lib/modules/"$abi"/kernel/drivers/video/
+    nvidia=1
+else
+    nvidia=
+fi
 /out/apk-zstd mkpkg --xattrs=no --files /out/stage --compression zstd:9 --sign-key "$key" \
     --info "name:$package" --info "version:$release" --info "arch:$architecture" \
     --info "description:UFlinux kernel for $name" --info "license:GPL-2.0-only" \
@@ -32,23 +43,38 @@ mv /out/stage/lib/modules /out/modules-root/lib/modules
     --info "license:GPL-2.0-only" \
     --info "url:https://github.com/UFlinux-project/kernel" --info "depends:kmod" \
     --output "/out/$modules_package-$release.apk"
+if [ -n "$nvidia" ]; then
+    driver_version=$(python3 -c 'import json,sys; print(json.load(open("/out/build.json"))["nvidia"]["version"])')
+    test -n "$driver_version"
+    /out/apk-zstd mkpkg --xattrs=no --files /out/driver-root --compression zstd:9 --sign-key "$key" \
+        --info "name:$driver_package" --info "version:$driver_version-r$revision" --info "arch:$architecture" \
+        --info "description:NVIDIA open GPU kernel modules for the UFlinux $name kernel" \
+        --info "license:MIT AND GPL-2.0-only" \
+        --info "url:https://github.com/NVIDIA/open-gpu-kernel-modules" \
+        --info "depends:kmod $modules_package=$release" \
+        --output "/out/$driver_package-$driver_version-r$revision.apk"
+fi
 mv /out/modules-root/lib/modules /out/stage/lib/modules
-rm -rf /out/modules-root
+rm -rf /out/modules-root /out/driver-root
 cp "$key.pub" /out/
 
 # shellcheck source=scripts/guest-root.sh
 . "$(dirname "$0")/guest-root.sh"
 install_guest_root "$architecture"
 # Run test-root tools in their own root, including apk's kernel triggers.
+expected=2
+[ -n "$nvidia" ] && expected=3
 i=0
+apks=
 for apk in /out/*.apk; do
     i=$((i + 1))
-    cp "$apk" "/guest/test-kernel-$i.apk"
+    cp "$apk" "/guest/$(basename "$apk")"
+    apks="$apks /$(basename "$apk")"
 done
-test "$i" = 2
+test "$i" = "$expected"
 cp /out/apk-zstd /guest/tmp/apk-zstd
-chroot /guest /tmp/apk-zstd add /test-kernel-1.apk /test-kernel-2.apk
-rm /guest/test-kernel-*.apk /guest/tmp/apk-zstd
+chroot /guest /tmp/apk-zstd add $apks
+rm /guest/*.apk /guest/tmp/apk-zstd
 for path in "boot/vmlinuz-uflinux-$name" "boot/initramfs-uflinux-$name"; do
     test -s "/guest/$path"
 done
@@ -69,6 +95,7 @@ test -n "$sigmodule" || sigmodule=$(awk -F: '$2 == "" && $1 ~ /\.ko/ {print $1; 
 sigmodule=${sigmodule##*/}
 sigmodule=${sigmodule%%.ko*}
 sigmodule=${sigmodule//-/_}
+signer=
 if [ -s "/out/stage/boot/module-cert-uflinux-$name.x509" ]; then
     # The signer field is the subject commonName of the embedded certificate.
     signer=$(openssl x509 -in "/out/stage/boot/module-cert-uflinux-$name.x509" -noout -subject -nameopt multiline,utf8 \
@@ -76,12 +103,24 @@ if [ -s "/out/stage/boot/module-cert-uflinux-$name.x509" ]; then
     test -n "$signer"
     test "$(modinfo -F signer "$module")" = "$signer"
 fi
+if [ -n "$nvidia" ]; then
+    # The driver modules share the kernel's module tree, so they have to match this kernel's
+    # vermagic and carry the flavor's signature even though they come from another source.
+    for module in $(python3 -c 'import json,sys; print(" ".join(json.load(open("/out/build.json"))["nvidia"]["modules"]))'); do
+        driver="/guest/lib/modules/$abi/kernel/drivers/video/$module.ko.zst"
+        test -s "$driver"
+        test "$(modinfo -F vermagic "$driver" | cut -d ' ' -f1)" = "$abi"
+        [ -z "$signer" ] || test "$(modinfo -F signer "$driver")" = "$signer"
+    done
+    # depmod has to know about them, otherwise modprobe would never find the driver.
+    grep -q '^kernel/drivers/video/nvidia.ko.zst:' "/guest/lib/modules/$abi/modules.dep"
+fi
 cp "/guest/boot/initramfs-uflinux-$name" /out/initramfs
 chmod 644 /out/initramfs
 /out/apk-zstd verify /out/*.apk
 
 case "$name" in
-  x86_64|aarch64|virt-*) ;;
+  x86_64|nvidia|aarch64|virt-*) ;;
   *) exit 0;;
 esac
 if [ -n "$profile_guest" ]; then

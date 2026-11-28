@@ -135,6 +135,27 @@ def pi():
     return source
 
 
+def nvidia_open():
+    """Newest open-gpu-kernel-modules release, used by flavors that ship it as modules.
+
+    The driver is an optional package for one flavor, so a GitHub outage or a tagging change must
+    not abort resolution for the whole matrix. Anything that stops us reading the newest release is
+    returned as an error record, which the build reports and the release publishes without a driver.
+    """
+    repo = "NVIDIA/open-gpu-kernel-modules"
+    unavailable = "NVIDIA open kernel modules are unavailable, since {}"
+    try:
+        tag = github(f"{repo}/releases/latest")["tag_name"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return {"version": None, "ref": "", "url": None,
+                "error": unavailable.format(f"the newest {repo} release could not be read ({error})")}
+    if not re.fullmatch(r"v?\d+\.\d+\.\d+", tag):
+        return {"version": None, "ref": "", "url": None,
+                "error": unavailable.format(f"{repo} published an unexpected release tag {tag!r}")}
+    return {"version": tag[1:] if tag.startswith("v") else tag, "ref": tag,
+            "url": f"https://codeload.github.com/{repo}/tar.gz/{tag}"}
+
+
 def alpine_root(arch):
     listing = fetch(f"{ALPINE}/latest-stable/releases/{arch}/latest-releases.yaml").decode()
     match = re.search(r"^  file: (alpine-minirootfs-([0-9.]+)-[^\s]+\.tar\.gz)$", listing, re.M)
@@ -264,9 +285,14 @@ def resolve(selected=None, *, generate_profiles=False):
         bbr = topic_patch(kernel_series)
         bbr.extend(candidates(*patch_repos["cachy"], r"^(\d+\.\d+)/[^/]*bbr3\.patch$", kernel_series))
         groups[kernel_series] = {"bore": bore, "le9uo": le9, "bbr": bbr}
+    drivers = {}
     for name, target in targets.items():
         target.update(sources[target["source"]])
         target.update(groups[target["version"].rsplit(".", 1)[0]])
+        if target.get("nvidia_open"):
+            if "nvidia" not in drivers:
+                drivers["nvidia"] = nvidia_open()
+            target["nvidia"] = drivers["nvidia"]
         if "config" in target:
             target["config_url"] = raw("alpinelinux/aports", aports, f"main/linux-lts/{target['config']}")
         target["alpine"] = alpine[target["apk"]]

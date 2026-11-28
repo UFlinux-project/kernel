@@ -21,6 +21,7 @@ on:
         options:
           - none
           - x86_64
+          - nvidia
           - aarch64
           - virt-x86_64
           - virt-aarch64
@@ -327,6 +328,10 @@ jobs:
           fi
           export UFLINUX_KERNEL_PHASE=compile
           time scripts/container.sh "$TARGET" work/resolved.json "work/$TARGET" "${args[@]}"
+          # A driver that cannot build against this kernel costs only the driver package; say so
+          # here, where it happened, instead of leaving it to the publish job.
+          driver_error=$(jq -r '.nvidia.error // empty' "work/$TARGET/build.json")
+          [[ -z "$driver_error" ]] || echo "::warning::$driver_error"
           if [[ "$REQUIRE_PROFILE" == true ]]; then
             jq -e '.pgo == true' "work/$TARGET/build.json"
           fi
@@ -388,7 +393,7 @@ jobs:
           output="work/$TARGET"
           mkdir -p "$output"
           time tar --same-permissions -xf work/compiled.tar.zst -C "$output"
-          if [[ "$TARGET" == *x86_64 ]]; then
+          if [[ "$TARGET" == *x86_64 || "$TARGET" == nvidia ]]; then
             tar -xf work/bolt-tool.tar -C "$output"
           else
             command -v llvm-bolt
@@ -602,6 +607,20 @@ jobs:
             [[ ${#modules[@]} == 1 ]]
             test -s "dist/build-$target.json"
             test -s "dist/source-$target.tar.zst"
+            if [[ "$(jq -r --arg target "$target" '.[$target].nvidia_open // false' targets.json)" == true ]]; then
+              # The out-of-tree driver is its own package, versioned with the driver. NVIDIA only
+              # supports kernels as new as the driver itself, so a newer kernel can fail the driver
+              # build; that costs the driver package, not the release, but it has to be visible.
+              driver=(dist/linux-uflinux-"$target"-nvidia-open-[0-9]*.apk)
+              if [[ ${#driver[@]} == 1 ]]; then
+                jq -e '.nvidia.version' "dist/build-$target.json" >/dev/null
+              elif jq -e '.nvidia.error' "dist/build-$target.json" >/dev/null; then
+                echo "::warning::$(jq -r '.nvidia.error' "dist/build-$target.json")"
+              else
+                echo "::error::The $target flavor has neither a driver package nor a recorded driver failure"
+                exit 1
+              fi
+            fi
           done
           for arch in x86_64 aarch64 riscv64; do
             test -s "dist/apk-zstd-$arch"

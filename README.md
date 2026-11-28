@@ -1,10 +1,11 @@
 # UFlinux kernel builder
 
-GitHub Actions builds installable Alpine APKs for four generic or virtual-machine targets and three board targets. A nightly run resolves upstream sources and skips a release whose inputs have already been published. A manual run can build the whole matrix or export a profiling kernel for a single flavor.
+GitHub Actions builds installable Alpine APKs for five generic or virtual-machine targets and three board targets. A nightly run resolves upstream sources and skips a release whose inputs have already been published. A manual run can build the whole matrix or export a profiling kernel for a single flavor.
 
 | Target | Alpine architecture | Kernel source |
 |---|---|---|
 | `x86_64`, `aarch64` | Matching Alpine architecture | Latest stable kernel.org release, with Alpine's stable generic configs |
+| `nvidia` | `x86_64` | Same as `x86_64`, plus the latest NVIDIA open GPU kernel modules as a third package |
 | `virt-x86_64`, `virt-aarch64` | `x86_64`, `aarch64` | Same kernel.org source, with Alpine's stable VirtIO guest configs |
 | `orangepi-rv2` | `riscv64` | Orange Pi's current RV2 vendor recipe |
 | `dragon-q6a` | `aarch64` | The kernel referenced by Radxa's latest stable Q6A `linux-qcom` release |
@@ -75,6 +76,12 @@ Set the repository Actions secret `UFLINUX_MODULE_SIGNING_KEY` to the base64-enc
 Modules install Zstd-compressed (`.ko.zst`) and the ARM64 EFI flavors compress the boot image with Zstd. Alpine's `kmod` and `mkinitfs` are built against `zstd-dev`, and the in-kernel Zstd decompressor is already resident, so neither the initramfs generator nor early userspace needs anything extra.
 
 Each flavor now publishes two APKs: `linux-uflinux-<target>` (the boot files: kernel image, initramfs inputs, `System.map`, and build config) and `linux-uflinux-<target>-modules` (the whole `/lib/modules/<abi>` tree, including `modules.dep` and the built-in module lists). The kernel package depends on the exactly matching modules package, so `apk add ./linux-uflinux-<target>-<version>-r<revision>.apk` still installs both and the mkinitfs trigger still sees a complete module tree. A driverless guest can keep the kernel package and drop the modules package later if the package manager allows it.
+
+### The `nvidia` flavor
+
+The `nvidia` flavor is the `x86_64` kernel with the in-tree `nouveau` driver disabled and the open GPU kernel modules from [NVIDIA/open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules) built out of tree against it. `scripts/resolve.py` pins the newest release tag at resolve time and records it in `resolved.json`; the fingerprint includes it, so a new driver release invalidates the CI caches. `scripts/build.py` downloads that tarball, builds `nvidia`, `nvidia-modeset`, `nvidia-drm`, `nvidia-uvm`, and `nvidia-peermem` with the same Clang toolchain after the in-tree modules are staged, and installs them signed and Zstd-compressed at `kernel/drivers/video/` in the module tree. `build-<target>.json` records the driver version, tag, tarball URL, and SHA-256. NVIDIA supports kernels as new as the driver itself and no newer, so a kernel that outruns the driver fails the module build; that costs only the driver package. The flavor still publishes its kernel and modules APKs, and the reason is recorded in the release annotations and in `build-<target>.json`. The same applies when the resolver cannot read the newest release tag at all — a GitHub outage or an unexpected tag costs the driver package, never the rest of the matrix.
+
+That flavor publishes a third APK, `linux-uflinux-nvidia-nvidia-open-<driver-version>-r<revision>.apk`, which holds only the driver modules and depends on the exactly matching `linux-uflinux-nvidia-modules` package. `apk add ./linux-uflinux-nvidia-<version>-r<revision>.apk` installs the kernel and modules packages; add the driver APK explicitly if you want the NVIDIA driver. `nvidia-drm` needs `options nvidia-drm modeset=1` for kernel modesetting, and the GPU's firmware is not in the kernel tree: install the matching `linux-firmware` package. `i915` stays enabled so systems with both an Intel iGPU and a NVIDIA GPU still light up a console.
 
 ## Publish and install
 
